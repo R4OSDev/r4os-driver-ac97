@@ -1,0 +1,13 @@
+﻿AC97.R4D provenance
+===================
+
+Fachliche Quelle:
+- Eingefrorener Altprojekt-Commit: 259cbfac272c47ac1a7828de973512d17b29ae10
+- Urspruenglicher Pfad: Code/System/Driver/AC97
+
+Transfer in R4OS 0.64.18:
+- Source, Manifest und modulnahe Dokumentation wurden aus dem eingefrorenen
+  Commit uebernommen.
+- Nur Paketpin, Buildstarter, Settings und Repositoryhygiene wurden an die
+  neue Mehrrepo-Struktur angepasst; die Treiberimplementierung blieb
+  unveraendert.
