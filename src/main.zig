@@ -54,6 +54,8 @@ const State = struct {
     backend: r4os.abi.AudioBackend = .{},
     backend_registered: bool = false,
     present: bool = false,
+    stream_lock: bool = false,
+    shutting_down: bool = false,
     playback_started: bool = false,
     next_dma_index: usize = 0,
     bdl: r4os.abi.DmaBuffer = .{},
@@ -99,6 +101,7 @@ fn msTicks(ctx: *const r4os.r4dev.DriverContext, ms: u64) u64 {
 export fn ac97_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state = .{ .api = api };
     var ctx = context();
+    if (!ctx.apiCompatible()) return -10;
     ctx.logInfo("AC97.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -130,16 +133,20 @@ export fn ac97_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 
     if (!allocDmaState(&ctx)) {
         ctx.logError("AC97.R4D DMA allocation failed");
-        shutdownHardware(&ctx);
+        _ = shutdownHardware(&ctx);
         return -5;
     }
 
     codecReset(&ctx);
-    resetPlayback(&ctx);
-    state.present = true;
+    if (!resetPlayback(&ctx)) {
+        ctx.logError("AC97.R4D playback reset failed");
+        _ = shutdownHardware(&ctx);
+        return -7;
+    }
+    @atomicStore(bool, &state.present, true, .release);
     if (!registerPlaybackBackend(&ctx)) {
         ctx.logError("AC97.R4D audio backend register failed");
-        shutdownHardware(&ctx);
+        _ = shutdownHardware(&ctx);
         return -6;
     }
     state.initialized = true;
@@ -150,9 +157,8 @@ export fn ac97_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
 export fn ac97_shutdown() callconv(.c) i32 {
     var ctx = context();
     ctx.logInfo("AC97.R4D shutdown");
-    unregisterPlaybackBackend(&ctx);
-    shutdownHardware(&ctx);
-    return 0;
+    if (!shutdownHardware(&ctx)) return -1;
+    return if (unregisterPlaybackBackend(&ctx)) 0 else -2;
 }
 
 fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
@@ -163,12 +169,12 @@ fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
 }
 
 fn allocDmaState(ctx: *const r4os.r4dev.DriverContext) bool {
-    if (ctx.allocDmaRegion(@intCast(@sizeOf(BdlEntry) * BDL_ENTRY_COUNT), 16, &state.bdl) != 0) return false;
+    if (ctx.allocDmaRegionConstrained(@intCast(@sizeOf(BdlEntry) * BDL_ENTRY_COUNT), 16, 0xFFFF_FFFF, &state.bdl) != 0) return false;
     if (state.bdl.phys_addr == 0 or state.bdl.virt_addr == 0) return false;
 
     var i: usize = 0;
     while (i < DMA_BUFFER_COUNT) : (i += 1) {
-        if (ctx.allocDmaRegion(MAX_DMA_BYTES, 16, &state.dma[i]) != 0) return false;
+        if (ctx.allocDmaRegionConstrained(MAX_DMA_BYTES, 16, 0xFFFF_FFFF, &state.dma[i]) != 0) return false;
         if (state.dma[i].phys_addr == 0 or state.dma[i].virt_addr == 0) return false;
     }
 
@@ -218,17 +224,21 @@ fn registerPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
-fn unregisterPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.backend_registered) return;
-    _ = ctx.unregisterAudioBackend("AC97");
+fn unregisterPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (!state.backend_registered) return true;
+    if (ctx.unregisterAudioBackend("AC97") != 0) return false;
     state.backend_registered = false;
+    return true;
 }
 
 fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
     const write_start = ctx.tickCount();
-    if (!state.present or state.nabm_port == 0) return finishWrite(-1, write_start);
+    if (!@atomicLoad(bool, &state.present, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire) or state.nabm_port == 0) return finishWrite(-1, write_start);
+    if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) return finishWrite(r4os.abi.service_api_result_busy, write_start);
+    defer releaseStream();
+    if (@atomicLoad(bool, &state.shutting_down, .acquire)) return finishWrite(-1, write_start);
     const input = data[0..@as(usize, @intCast(len))];
     if (pcm.outputFrameCount(input.len, rate, channels, format) == 0) return finishWrite(-2, write_start);
 
@@ -244,13 +254,13 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
         const index = state.next_dma_index;
         if (state.playback_started and !waitBufferReusable(&ctx, index)) {
             state.timeout_count += 1;
-            resetPlayback(&ctx);
+            if (!resetPlayback(&ctx)) return finishWrite(-5, write_start);
         }
 
         const out = dmaSlice(index) orelse return finishWrite(-3, write_start);
         const converted = pcm.convertStreamingToStereoS16(&state.resampler_state, input, rate, channels, format, out);
         if (converted < pcm.TARGET_FRAME_BYTES) break;
-        queueDmaBuffer(&ctx, index, converted);
+        if (!queueDmaBuffer(&ctx, index, converted)) return finishWrite(-6, write_start);
         const frames = converted / pcm.TARGET_FRAME_BYTES;
         state.last_output_frames += frames;
         state.converted_frame_count += frames;
@@ -263,23 +273,29 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
-    stopPlayback(&ctx);
-    state.last_result = 0;
-    return 0;
+    if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) return setLastResult(r4os.abi.service_api_result_busy);
+    const stopped = stopPlayback(&ctx, true);
+    releaseStream();
+    return setLastResult(if (stopped) 0 else -1);
 }
 
 fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
-    shutdownHardware(&ctx);
-    state.last_result = 0;
-    return 0;
+    return setLastResult(if (shutdownHardware(&ctx)) 0 else -1);
 }
 
 fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) callconv(.c) i32 {
     _ = context_arg;
+    if (!tryAcquireStream()) {
+        out.* = .{};
+        return r4os.abi.service_api_result_busy;
+    }
+    defer releaseStream();
+    var ctx = context();
+    serviceStatus(&ctx);
     out.* = .{
-        .active = if (state.present and state.backend_registered) 1 else 0,
+        .active = if (@atomicLoad(bool, &state.present, .acquire) and state.backend_registered) 1 else 0,
         .writes = state.write_count,
         .underruns = state.underrun_count + state.dch_count,
         .errors = state.error_count + state.timeout_count + state.fifo_error_count,
@@ -300,7 +316,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
     return 0;
 }
 
-fn queueDmaBuffer(ctx: *const r4os.r4dev.DriverContext, index: usize, len: usize) void {
+fn queueDmaBuffer(ctx: *const r4os.r4dev.DriverContext, index: usize, len: usize) bool {
     const refill_start = ctx.tickCount();
     serviceStatus(ctx);
     const starting = !state.playback_started;
@@ -313,7 +329,7 @@ fn queueDmaBuffer(ctx: *const r4os.r4dev.DriverContext, index: usize, len: usize
         .control = BDL_IOC,
     };
     if (starting) {
-        resetPlayback(ctx);
+        if (!resetPlayback(ctx)) return false;
         ctx.portOutl(state.nabm_port + PO_BDBAR, @truncate(state.bdl.phys_addr));
         state.playback_started = true;
     }
@@ -321,14 +337,19 @@ fn queueDmaBuffer(ctx: *const r4os.r4dev.DriverContext, index: usize, len: usize
     ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) | CR_RUN);
     state.next_dma_index = (index + 1) % DMA_BUFFER_COUNT;
     recordTickStat(&state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
+    return true;
 }
 
-fn resetPlayback(ctx: *const r4os.r4dev.DriverContext) void {
-    if (state.nabm_port == 0) return;
+fn resetPlayback(ctx: *const r4os.r4dev.DriverContext) bool {
+    if (state.nabm_port == 0) return true;
     state.reset_count += 1;
     ctx.portOutb(state.nabm_port + PO_CR, CR_RESET);
     var guard: u32 = 0;
     while ((ctx.portInb(state.nabm_port + PO_CR) & CR_RESET) != 0 and guard < 100000) : (guard += 1) {}
+    if ((ctx.portInb(state.nabm_port + PO_CR) & CR_RESET) != 0) {
+        state.timeout_count += 1;
+        return false;
+    }
     ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
     state.previous_status = 0;
     state.last_status = ctx.portInw(state.nabm_port + PO_SR);
@@ -336,16 +357,23 @@ fn resetPlayback(ctx: *const r4os.r4dev.DriverContext) void {
     state.next_dma_index = 0;
     state.resampler_state.reset();
     if (state.bdl.phys_addr != 0) ctx.portOutl(state.nabm_port + PO_BDBAR, @truncate(state.bdl.phys_addr));
+    return true;
 }
 
-fn stopPlayback(ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.present or state.nabm_port == 0) return;
-    serviceStatus(ctx);
-    drainPlayback(ctx);
+fn stopPlayback(ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
+    if (state.nabm_port == 0) return true;
+    if (@atomicLoad(bool, &state.present, .acquire)) {
+        serviceStatus(ctx);
+        if (drain) drainPlayback(ctx);
+    }
     ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) & ~CR_RUN);
     ctx.portOutb(state.nabm_port + PO_CR, CR_RESET);
     var guard: u32 = 0;
     while ((ctx.portInb(state.nabm_port + PO_CR) & CR_RESET) != 0 and guard < 100000) : (guard += 1) {}
+    if ((ctx.portInb(state.nabm_port + PO_CR) & CR_RESET) != 0) {
+        state.timeout_count += 1;
+        return false;
+    }
     ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
     state.previous_status = 0;
     state.last_status = ctx.portInw(state.nabm_port + PO_SR);
@@ -354,17 +382,14 @@ fn stopPlayback(ctx: *const r4os.r4dev.DriverContext) void {
     state.next_dma_index = 0;
     state.resampler_state.reset();
     state.stop_count += 1;
+    return true;
 }
 
-fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
-    stopPlayback(ctx);
-    if (state.nabm_port != 0) {
-        ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) & ~CR_RUN);
-        ctx.portOutb(state.nabm_port + PO_CR, CR_RESET);
-        var guard: u32 = 0;
-        while ((ctx.portInb(state.nabm_port + PO_CR) & CR_RESET) != 0 and guard < 100000) : (guard += 1) {}
-        ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
-    }
+fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
+    @atomicStore(bool, &state.shutting_down, true, .release);
+    if (!acquireStream(ctx, PLAYBACK_WAIT_MS)) return false;
+    defer releaseStream();
+    if (!stopPlayback(ctx, true)) return false;
     clearBdl();
 
     var i: usize = 0;
@@ -373,10 +398,10 @@ fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) void {
     }
     if (state.bdl.phys_addr != 0) ctx.freeDmaRegion(&state.bdl);
     state.initialized = false;
-    state.present = false;
+    @atomicStore(bool, &state.present, false, .release);
     state.playback_started = false;
     state.next_dma_index = 0;
-    state.backend_registered = false;
+    return true;
 }
 
 fn waitBufferReusable(ctx: *const r4os.r4dev.DriverContext, index: usize) bool {
@@ -385,6 +410,7 @@ fn waitBufferReusable(ctx: *const r4os.r4dev.DriverContext, index: usize) bool {
         serviceStatus(ctx);
         if ((ctx.portInb(state.nabm_port + PO_CR) & CR_RUN) == 0) return true;
         if ((ctx.portInb(state.nabm_port + PO_CIV) & 0x1F) != @as(u8, @intCast(index))) return true;
+        ctx.waitTicks(1);
     }
     return false;
 }
@@ -398,11 +424,12 @@ fn drainPlayback(ctx: *const r4os.r4dev.DriverContext) void {
         const cr = ctx.portInb(state.nabm_port + PO_CR);
         const sr = ctx.portInw(state.nabm_port + PO_SR);
         if ((cr & CR_RUN) == 0 or (sr & SR_DCH) != 0) return;
+        ctx.waitTicks(1);
     }
 }
 
 fn serviceStatus(ctx: *const r4os.r4dev.DriverContext) void {
-    if (!state.present or state.nabm_port == 0) return;
+    if (!@atomicLoad(bool, &state.present, .acquire) or state.nabm_port == 0) return;
     const sr = ctx.portInw(state.nabm_port + PO_SR);
     const raised = sr & ~state.previous_status;
     state.last_status = sr;
@@ -421,6 +448,24 @@ fn dmaSlice(index: usize) ?[]u8 {
     const bytes = if (buffer.bytes < MAX_DMA_BYTES) buffer.bytes else MAX_DMA_BYTES;
     const ptr: [*]u8 = @ptrFromInt(buffer.virt_addr);
     return ptr[0..@as(usize, @intCast(bytes))];
+}
+
+fn tryAcquireStream() bool {
+    return !@atomicRmw(bool, &state.stream_lock, .Xchg, true, .acq_rel);
+}
+
+fn acquireStream(ctx: *const r4os.r4dev.DriverContext, timeout_ms: u64) bool {
+    if (tryAcquireStream()) return true;
+    const deadline = ctx.tickCount() + msTicks(ctx, timeout_ms);
+    while (ctx.tickCount() < deadline) {
+        ctx.waitTicks(1);
+        if (tryAcquireStream()) return true;
+    }
+    return false;
+}
+
+fn releaseStream() void {
+    @atomicStore(bool, &state.stream_lock, false, .release);
 }
 
 fn setLastResult(result: i32) i32 {

@@ -15,6 +15,14 @@ Stand 0.38.5:
 - BDL-/DMA-Pufferfuellung fuer echte PCM-Ausgabe
 - Stop, Drain/Timeout, Statuszaehler und Shutdown-Cleanup
 
+Stand 0.69.17:
+- BDL und alle Samplepuffer werden wegen der 32-Bit-AC97-Adressen garantiert
+  unterhalb von 4 GiB alloziert; Adressen werden nicht mehr still gekuerzt.
+- Write, Stop, Status und Shutdown teilen eine serialisierte Streamgrenze.
+- Shutdown schliesst neue Writes, stoppt und verifiziert den Busmaster-Stream
+  und gibt DMA erst nach geloeschtem Resetbit frei. Erst danach wird das
+  Audio-Backend entfernt; ein Timeout vetoisiert den Modulabbau.
+
 `AC97.R4D` ist seit 0.38.3 der produktive AC97-Ausgabepfad fuer
 `DRIVER=AC97`. Seit 0.38.4 ist der alte Built-in-AC97-Quellpfad entfernt;
 AC97 hat keinen stillen Kernel-Produktiv-Fallback mehr. Seit 0.38.5 sichert
