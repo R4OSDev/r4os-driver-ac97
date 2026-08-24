@@ -231,10 +231,17 @@ fn unregisterPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
     return true;
 }
 
+fn acceptsPcmInput(rate: u32, channels: u16, format: u16) bool {
+    if (rate < MIN_RATE or rate > MAX_RATE) return false;
+    if (channels == 0 or channels > pcm.TARGET_CHANNELS) return false;
+    return format == pcm.FORMAT_S16LE or format == pcm.FORMAT_U8;
+}
+
 fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
     const write_start = ctx.tickCount();
+    if (!acceptsPcmInput(rate, channels, format)) return finishWrite(r4os.abi.service_api_result_invalid, write_start);
     if (!@atomicLoad(bool, &state.present, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire) or state.nabm_port == 0) return finishWrite(-1, write_start);
     if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) return finishWrite(r4os.abi.service_api_result_busy, write_start);
     defer releaseStream();
