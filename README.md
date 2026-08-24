@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.1`
+- Version: `0.1.4`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -18,7 +18,7 @@ On Windows:
 
     Build.bat
 
-On Linux or macOS:
+On Linux:
 
     ./Build.sh
 
@@ -29,9 +29,14 @@ mapped local checkouts.
 
 ## Documentation
 
-Detailed German technical notes from the migration are preserved in
-`DOCUMENTATION.de.txt`. Source-transfer provenance is recorded in
-`PROVENANCE.txt`.
+The driver publishes source writes atomically into a bounded eight-buffer
+queue backed by the controller's 32-entry descriptor ring. Busy is reported
+before conversion when that queue lacks space, so retries neither reset nor
+duplicate retained resampler progress. CIV/CELV refresh the current queue
+fill; normal LVBCI and DCH completion states are not reported as underruns.
+
+Detailed German technical notes are in `DOCUMENTATION.de.txt`.
+Source-transfer provenance is recorded in `PROVENANCE.txt`.
 
 ## License
 

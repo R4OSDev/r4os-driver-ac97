@@ -1,7 +1,9 @@
-﻿AC97.R4D
-========
+﻿AC97.R4D 0.1.4
+================
 
-AC97.R4D ist der ladbare AC97-Hardwaretreiber fuer die 0.38.X-Auslagerung.
+AC97.R4D ist der ladbare AC97-Hardware-Ausgabetreiber. Er besitzt PCI-Suche,
+Codec-Setup, DMA und den AC97-spezifischen PCM-Backendpfad; der Kernel stellt
+nur die gemeinsame R4DEV- und AudioBackend-Grenze bereit.
 
 Stand 0.38.5:
 - echter R4D-Container mit Treibername AC97 und Typ audio
@@ -23,28 +25,59 @@ Stand 0.69.17:
   und gibt DMA erst nach geloeschtem Resetbit frei. Erst danach wird das
   Audio-Backend entfernt; ein Timeout vetoisiert den Modulabbau.
 
+Stand 0.69.27:
+- Der 32 Eintraege grosse Hardware-BDL-Ring wird mit acht wiederverwendbaren
+  4.096-Byte-DMA-Puffern betrieben. DescriptorQueue verwaltet Producer,
+  Consumer und hoechstens acht ausstehende Descriptoren. Ein DMA-Puffer wird
+  erst wieder beschrieben, nachdem CIV beziehungsweise CELV seinen Besitz
+  freigegeben haben.
+- writePcm aktualisiert den Hardwarestand und meldet sofort Busy, wenn nicht
+  genug Queueplaetze fuer den gesamten Quellwrite frei sind. Es wartet nicht
+  mehr 100 ms auf einen einzelnen CIV-Wert und ersetzt Rueckstau nicht durch
+  einen Controllerreset.
+- PCM wird zuerst vollstaendig in freie DMA-Puffer gewandelt und danach mit
+  genau einem LVI-Update veroeffentlicht. Der Resamplerzustand wird bei jeder
+  fehlgeschlagenen Vorbereitung auf den Stand vor dem Write zurueckgesetzt.
+  Init und Stop setzen den Resampler weiterhin bewusst zurueck; Busy und
+  laufende Writes tun das nicht.
+- BackendStatus liest CIV, LVI und SR als gemeinsamen 32-Bit-Snapshot. writes
+  zaehlt erfolgreiche Quellwrites, refills die publizierten DMA-Descriptoren
+  und queued_buffers den aktuellen Pending-Wert. LVBCI ist ein normaler
+  Last-Valid-Abschluss, DCH ein Controllerzustand; nur FIFOE wird als
+  Hardware-Unterlauf gemeldet.
+- Drain wartet auf eine leere Software-Pendingmenge und DCH. Ein Ablauf der
+  Frist bleibt sichtbar und der anschliessende Reset stellt in jedem Fall
+  einen sicheren DMA-Abbau her.
+
 `AC97.R4D` ist seit 0.38.3 der produktive AC97-Ausgabepfad fuer
 `DRIVER=AC97`. Seit 0.38.4 ist der alte Built-in-AC97-Quellpfad entfernt;
 AC97 hat keinen stillen Kernel-Produktiv-Fallback mehr. Seit 0.38.5 sichert
 `Tests/Gate/CheckAudioR4D038.zig` diesen Abschluss als
 statischen Guard ab.
 
-Projektstruktur seit 0.51.22
---------------------------------
+Projektstruktur und Build
+-------------------------
 
 Dieses Verzeichnis ist ein eigenstaendiges R4OS-SDK-Projekt fuer AC97.R4D.
 
-Build:
+Windows:
 
-    cd Code\System\Driver\AC97
-    ..\..\..\DevTools\Zig\zig.exe build
+    Build.bat test
+
+Linux:
+
+    ./Build.sh test
+
+Der Testschritt baut und inspiziert AC97.R4D und prueft begrenzte
+Backpressure, CIV-/CELV-Besitzfreigabe, Wraparound sowie die
+phasenabhaengige Ausgabereservierung.
 
 Artefakt:
 
-    zig-out\AC97.R4D
+    Artifacts/Modules/AC97/AC97.R4D
 
 Manifest:
 
     module.R4MF
 
-Image-Zielpfad: C:\R4OS\DRIVERS\AC97.R4D
+Image-Zielpfad: /R4OS/DRIVERS/AC97.R4D
