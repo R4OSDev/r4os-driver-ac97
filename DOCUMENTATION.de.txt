@@ -1,4 +1,4 @@
-﻿AC97.R4D 0.1.4
+﻿AC97.R4D 0.1.5
 ================
 
 AC97.R4D ist der ladbare AC97-Hardware-Ausgabetreiber. Er besitzt PCI-Suche,
@@ -49,6 +49,26 @@ Stand 0.69.27:
   Frist bleibt sichtbar und der anschliessende Reset stellt in jedem Fall
   einen sicheren DMA-Abbau her.
 
+Stand 0.69.42:
+- Der Treiber aktiviert die AC97-PCM-Out-Interrupts IOCE, FEIE und LVBIE,
+  versucht MSI und registriert bei Bedarf die deklarierte sowie die
+  gerouteten INTx-Leitungen. Die ISR liest und quittiert nur die W1C-
+  Statusbits, wartet nicht und kopiert keine PCM-Daten.
+- Status, CIV/CELV-Fortschritt und FIFO-Recovery werden als DriverApi-v20-
+  Audioarbeit mit absoluter 10-ms-Deadline, stabilem AC97-Schluessel und
+  einem aus 2 ms abgeleiteten, auf vier Ticks begrenzten Budget ausgefuehrt.
+  Die getrennte EDF-Lane serialisiert das Geraet ausserhalb der normalen
+  Driver-FIFO.
+- Ein Callback verarbeitet genau einen Status-/Recoverydurchlauf. Eine
+  waehrenddessen veraenderte IRQ-Generation erzeugt hoechstens einen neuen
+  Successor mit eigener Deadline; zwei Handles begrenzen den Uebergang.
+- Stop und Shutdown sperren die Interruptquelle, melden IRQ/MSI ab, geben den
+  Stream-Lock frei und joinen anschliessend alle Completionhandles, bevor DMA
+  freigegeben wird. FIFO-Fehler bleiben als Underrun und Recovery sichtbar.
+- BDL, acht 4.096-Byte-DMA-Puffer und Periodengeometrie bleiben unveraendert,
+  weil Cursor-, Queue-, Unterlauf- und Deadlinewerte keine Segment-DMA-
+  Aenderung rechtfertigten.
+
 `AC97.R4D` ist seit 0.38.3 der produktive AC97-Ausgabepfad fuer
 `DRIVER=AC97`. Seit 0.38.4 ist der alte Built-in-AC97-Quellpfad entfernt;
 AC97 hat keinen stillen Kernel-Produktiv-Fallback mehr. Seit 0.38.5 sichert
@@ -70,7 +90,8 @@ Linux:
 
 Der Testschritt baut und inspiziert AC97.R4D und prueft begrenzte
 Backpressure, CIV-/CELV-Besitzfreigabe, Wraparound sowie die
-phasenabhaengige Ausgabereservierung.
+phasenabhaengige Ausgabereservierung und den genau-einen-Durchlauf-
+IRQ-Successorvertrag.
 
 Artefakt:
 

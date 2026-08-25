@@ -19,7 +19,16 @@ pub fn build(b: *std.Build) void {
     const queue_tests = b.addTest(.{ .root_module = queue_tests_module });
     const run_queue_tests = b.addRunArtifact(queue_tests);
 
+    const work_gate_tests_module = b.createModule(.{
+        .root_source_file = b.path("src/work_gate.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const work_gate_tests = b.addTest(.{ .root_module = work_gate_tests_module });
+    const run_work_gate_tests = b.addRunArtifact(work_gate_tests);
+
     const test_step = b.step("test", "Run AC97 descriptor queue ownership tests");
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_queue_tests.step);
+    test_step.dependOn(&run_work_gate_tests.step);
 }

@@ -1,6 +1,7 @@
 const r4os = @import("r4os");
 const pcm = r4os.audio_pcm;
 const queue_state = @import("queue_state.zig");
+const work_gate = @import("work_gate.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("ac97_init", "ac97_shutdown"));
@@ -23,6 +24,10 @@ const PO_CR: u16 = 0x1B;
 
 const CR_RUN: u8 = 0x01;
 const CR_RESET: u8 = 0x02;
+const CR_LVBIE: u8 = 0x04;
+const CR_FEIE: u8 = 0x08;
+const CR_IOCE: u8 = 0x10;
+const CR_IRQ_ENABLE: u8 = CR_LVBIE | CR_FEIE | CR_IOCE;
 const SR_CLEAR: u16 = 0x001C;
 const SR_DCH: u16 = 0x0001;
 const SR_CELV: u16 = 0x0002;
@@ -37,6 +42,10 @@ const MAX_RATE: u32 = 192_000;
 const MAX_DMA_BYTES: u32 = 4096;
 const DMA_BUFFER_COUNT: usize = 8;
 const BDL_ENTRY_COUNT: usize = 32;
+const IRQ_ROUTE_CAPACITY: usize = 9;
+const WORK_HANDLE_CAPACITY: usize = 2;
+const REFILL_DEADLINE_MS: u64 = 10;
+const REFILL_BUDGET_MS: u64 = 2;
 // 0.56.40: hz-neutral in ms (bei 100 Hz wie zuvor 10/200 Ticks).
 const PLAYBACK_WAIT_MS: u64 = 100;
 const DRAIN_WAIT_MS: u64 = 2000;
@@ -79,6 +88,7 @@ const State = struct {
     dch_count: u64 = 0,
     underrun_count: u64 = 0,
     fifo_error_count: u64 = 0,
+    recovery_count: u64 = 0,
     status_irq_count: u64 = 0,
     normal_completion_count: u64 = 0,
     busy_count: u64 = 0,
@@ -91,6 +101,21 @@ const State = struct {
     last_source_channels: u16 = 0,
     last_source_format: u16 = 0,
     last_output_frames: usize = 0,
+    irq_registered: bool = false,
+    irq_mode: u8 = 0,
+    irq_routes: [IRQ_ROUTE_CAPACITY]u8 = .{0xFF} ** IRQ_ROUTE_CAPACITY,
+    irq_route_count: usize = 0,
+    irq_active_route: u8 = 0xFF,
+    irq_count: u64 = 0,
+    irq_handled: u64 = 0,
+    irq_unhandled: u64 = 0,
+    irq_work_submitted: u64 = 0,
+    irq_work_dropped: u64 = 0,
+    irq_generation: u64 = 0,
+    irq_pending_status: u16 = 0,
+    work_pending: bool = false,
+    work_handles: [WORK_HANDLE_CAPACITY]u32 = .{0} ** WORK_HANDLE_CAPACITY,
+    recovery_pending: bool = false,
     resampler_state: pcm.ResamplerState = .{},
 };
 
@@ -149,6 +174,11 @@ export fn ac97_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
         _ = shutdownHardware(&ctx);
         return -7;
     }
+    if (!setupInterrupts(&ctx)) {
+        ctx.logError("AC97.R4D interrupt setup failed");
+        _ = shutdownHardware(&ctx);
+        return -8;
+    }
     @atomicStore(bool, &state.present, true, .release);
     if (!registerPlaybackBackend(&ctx)) {
         ctx.logError("AC97.R4D audio backend register failed");
@@ -172,6 +202,195 @@ fn findDevice(ctx: *const r4os.r4dev.DriverContext) ?r4os.abi.PciDeviceInfo {
     const found = ctx.pciFindByClass(CLASS_MULTIMEDIA, SUBCLASS_AUDIO, 0, &info);
     if (found < 0) return null;
     return info;
+}
+
+fn setupInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
+    state.irq_registered = false;
+    state.irq_mode = 0;
+    state.irq_route_count = 0;
+    state.irq_active_route = 0xFF;
+    state.irq_routes = .{0xFF} ** IRQ_ROUTE_CAPACITY;
+    disableInterrupts(ctx);
+
+    const msi_irq = ctx.pciEnableMsi(state.info);
+    if (msi_irq >= 0) {
+        state.irq_mode = 2;
+        if (msi_irq < 32) {
+            const route: u8 = @intCast(msi_irq);
+            if (ctx.irqRegister(route, irqHandler, @intFromPtr(&state), r4os.abi.irq_flag_msi) == 0) {
+                state.irq_routes[0] = route;
+                state.irq_route_count = 1;
+                state.irq_registered = true;
+            }
+        }
+        if (!state.irq_registered) {
+            if (ctx.pciDisableMsi(state.info) != 0) return false;
+            state.irq_mode = 0;
+        }
+    }
+
+    if (!state.irq_registered) {
+        if (state.info.interrupt_line < 32) _ = registerIrqRoute(ctx, state.info.interrupt_line);
+        var gsi: u8 = 16;
+        while (gsi < 24) : (gsi += 1) _ = registerIrqRoute(ctx, gsi);
+        if (state.irq_route_count > 0) {
+            state.irq_registered = true;
+            state.irq_mode = 1;
+        }
+    }
+    if (!state.irq_registered) return false;
+
+    ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
+    ctx.portOutb(state.nabm_port + PO_CR, (ctx.portInb(state.nabm_port + PO_CR) & ~CR_RUN) | CR_IRQ_ENABLE);
+    return true;
+}
+
+fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
+    if (route >= 32 or state.irq_route_count >= state.irq_routes.len) return false;
+    var index: usize = 0;
+    while (index < state.irq_route_count) : (index += 1) {
+        if (state.irq_routes[index] == route) return true;
+    }
+    if (ctx.irqRegister(route, irqHandler, @intFromPtr(&state), r4os.abi.irq_flag_shared | r4os.abi.irq_flag_level_low) != 0) return false;
+    state.irq_routes[state.irq_route_count] = route;
+    state.irq_route_count += 1;
+    return true;
+}
+
+fn disableInterrupts(ctx: *const r4os.r4dev.DriverContext) void {
+    if (state.nabm_port == 0) return;
+    ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) & ~CR_IRQ_ENABLE);
+    ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
+}
+
+fn unregisterInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
+    const used_msi = state.irq_mode == 2;
+    var index: usize = 0;
+    while (index < state.irq_route_count) : (index += 1) {
+        const route = state.irq_routes[index];
+        if (route < 32) _ = ctx.irqUnregister(route, irqHandler, @intFromPtr(&state));
+    }
+    state.irq_registered = false;
+    state.irq_route_count = 0;
+    state.irq_mode = 0;
+    if (used_msi and ctx.pciDisableMsi(state.info) != 0) return false;
+    return true;
+}
+
+fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
+    const s: *State = @ptrFromInt(raw_context);
+    if (!@atomicLoad(bool, &s.present, .acquire) or s.nabm_port == 0) return 0;
+    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    const status = ctx.portInw(s.nabm_port + PO_SR);
+    const pending = status & SR_CLEAR;
+    if (pending == 0) {
+        _ = @atomicRmw(u64, &s.irq_unhandled, .Add, 1, .acq_rel);
+        return 0;
+    }
+
+    _ = @atomicRmw(u64, &s.irq_count, .Add, 1, .acq_rel);
+    @atomicStore(u8, &s.irq_active_route, irq, .release);
+    _ = @atomicRmw(u16, &s.irq_pending_status, .Or, pending, .acq_rel);
+    ctx.portOutw(s.nabm_port + PO_SR, pending);
+    _ = @atomicRmw(u64, &s.irq_generation, .Add, 1, .acq_rel);
+    if (!@atomicLoad(bool, &s.shutting_down, .acquire)) scheduleStatusWork(s);
+    _ = @atomicRmw(u64, &s.irq_handled, .Add, 1, .acq_rel);
+    return r4os.abi.irq_result_handled;
+}
+
+fn scheduleStatusWork(s: *State) void {
+    if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
+    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    releaseCompletedWork(&ctx);
+    var free_index: ?usize = null;
+    for (&s.work_handles, 0..) |*stored, index| {
+        if (@atomicLoad(u32, stored, .acquire) == 0) {
+            free_index = index;
+            break;
+        }
+    }
+    const index = free_index orelse {
+        _ = @atomicRmw(u64, &s.irq_work_dropped, .Add, 1, .acq_rel);
+        @atomicStore(bool, &s.work_pending, false, .release);
+        return;
+    };
+
+    const budget_ticks = @min(r4os.abi.driver_work_deadline_max_budget_ticks, msTicks(&ctx, REFILL_BUDGET_MS));
+    const request = r4os.abi.DriverWorkRequest{
+        .handler = statusWork,
+        .context = @intFromPtr(s),
+        .flags = r4os.abi.driver_work_flag_from_irq,
+        .serial_key = @intFromPtr(s),
+        .deadline_tick = ctx.tickCount() +| msTicks(&ctx, REFILL_DEADLINE_MS),
+        .budget_ticks = @max(@as(u64, 1), budget_ticks),
+    };
+    var handle: u32 = 0;
+    if (ctx.workSubmitRequest(&request, &handle) != 0 or handle == 0) {
+        _ = @atomicRmw(u64, &s.irq_work_dropped, .Add, 1, .acq_rel);
+        @atomicStore(bool, &s.work_pending, false, .release);
+        return;
+    }
+    @atomicStore(u32, &s.work_handles[index], handle, .release);
+    _ = @atomicRmw(u64, &s.irq_work_submitted, .Add, 1, .acq_rel);
+}
+
+fn statusWork(raw_context: usize) callconv(.c) i32 {
+    const s: *State = @ptrFromInt(raw_context);
+    const ctx = r4os.r4dev.DriverContext.init(s.api);
+    releaseCompletedWork(&ctx);
+    const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
+    const pending_status = @atomicRmw(u16, &s.irq_pending_status, .Xchg, 0, .acq_rel);
+    if (!@atomicLoad(bool, &s.shutting_down, .acquire) and tryAcquireStream()) {
+        defer releaseStream();
+        const snapshot = ctx.portInl(s.nabm_port + PO_CIV);
+        const civ: usize = @intCast(snapshot & 0x1F);
+        const current_status: u16 = @truncate(snapshot >> 16);
+        serviceStatusSnapshot(&ctx, civ, current_status | pending_status);
+        if (@atomicRmw(bool, &s.recovery_pending, .Xchg, false, .acq_rel)) {
+            if (resetPlayback(&ctx)) {
+                s.recovery_count +%= 1;
+            } else {
+                s.error_count +%= 1;
+            }
+        }
+    }
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down) == .resubmit) scheduleStatusWork(s);
+    return 0;
+}
+
+fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext) void {
+    for (&state.work_handles) |*stored| {
+        const handle = @atomicLoad(u32, stored, .acquire);
+        if (handle == 0) continue;
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        if (ctx.completionStatus(handle, &status) != 0) continue;
+        if (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled) continue;
+        if (ctx.completionRelease(handle) == 0) @atomicStore(u32, stored, 0, .release);
+    }
+}
+
+fn releaseDriverWork(ctx: *const r4os.r4dev.DriverContext) bool {
+    @atomicStore(bool, &state.work_pending, false, .release);
+    @atomicStore(u16, &state.irq_pending_status, 0, .release);
+    var quiesced = true;
+    for (&state.work_handles) |*stored| {
+        const handle = @atomicLoad(u32, stored, .acquire);
+        if (handle == 0) continue;
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        if (ctx.completionStatus(handle, &status) == 0 and status.state == r4os.abi.driver_work_state_queued) _ = ctx.workCancel(handle);
+        var result: i32 = 0;
+        const wait_result = ctx.completionWait(handle, msTicks(ctx, PLAYBACK_WAIT_MS), &result);
+        if (wait_result != 0 and wait_result != r4os.abi.driver_work_result_cancelled) {
+            quiesced = false;
+            continue;
+        }
+        if (ctx.completionRelease(handle) == 0) {
+            @atomicStore(u32, stored, 0, .release);
+        } else {
+            quiesced = false;
+        }
+    }
+    return quiesced;
 }
 
 fn allocDmaState(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -249,6 +468,7 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     const write_start = ctx.tickCount();
     if (!acceptsPcmInput(rate, channels, format)) return finishWrite(r4os.abi.service_api_result_invalid, write_start);
     if (!@atomicLoad(bool, &state.present, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire) or state.nabm_port == 0) return finishWrite(-1, write_start);
+    releaseCompletedWork(&ctx);
     if (!tryAcquireStream()) return finishWrite(r4os.abi.service_api_result_busy, write_start);
     defer releaseStream();
     if (@atomicLoad(bool, &state.shutting_down, .acquire)) return finishWrite(-1, write_start);
@@ -334,6 +554,7 @@ fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) return setLastResult(r4os.abi.service_api_result_busy);
     const stopped = stopPlayback(&ctx, true);
     releaseStream();
+    if (!releaseDriverWork(&ctx)) return setLastResult(-1);
     return setLastResult(if (stopped) 0 else -1);
 }
 
@@ -356,7 +577,7 @@ fn backendStatus(context_arg: ?*anyopaque, out: *r4os.abi.AudioBackendStatus) ca
         .active = if (@atomicLoad(bool, &state.present, .acquire) and state.backend_registered) 1 else 0,
         .writes = state.write_count,
         .underruns = state.underrun_count,
-        .errors = state.error_count + state.timeout_count + state.fifo_error_count + state.drain_timeout_count,
+        .errors = state.error_count + state.timeout_count + state.fifo_error_count + state.drain_timeout_count + state.irq_work_dropped,
         .last_result = state.last_result,
         .reserved = 0,
         .refills = state.refill_count,
@@ -396,7 +617,7 @@ fn publishDmaBuffers(ctx: *const r4os.r4dev.DriverContext, lengths: []const usiz
     const last_descriptor = state.queue.descriptorAt(lengths.len - 1) orelse return false;
     if (!state.queue.commit(lengths.len)) return false;
     ctx.portOutb(state.nabm_port + PO_LVI, @intCast(last_descriptor));
-    ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) | CR_RUN);
+    ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) | CR_IRQ_ENABLE | CR_RUN);
     state.playback_started = true;
     state.refill_count +%= lengths.len;
     recordTickStat(&state.refill_total_ticks, &state.refill_max_ticks, &state.refill_last_ticks, refill_start);
@@ -415,6 +636,7 @@ fn resetPlayback(ctx: *const r4os.r4dev.DriverContext) bool {
         return false;
     }
     ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
+    ctx.portOutb(state.nabm_port + PO_CR, if (state.irq_registered) CR_IRQ_ENABLE else 0);
     state.last_status = ctx.portInw(state.nabm_port + PO_SR);
     state.playback_started = false;
     state.dch_active = (state.last_status & SR_DCH) != 0;
@@ -443,10 +665,15 @@ fn stopPlayback(ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
 
 fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
     @atomicStore(bool, &state.shutting_down, true, .release);
-    if (!acquireStream(ctx, PLAYBACK_WAIT_MS)) return false;
-    defer releaseStream();
-    const stopped = stopPlayback(ctx, true);
-    if (!stopped and state.playback_started) return false;
+    {
+        if (!acquireStream(ctx, PLAYBACK_WAIT_MS)) return false;
+        defer releaseStream();
+        const stopped = stopPlayback(ctx, true);
+        if (!stopped and state.playback_started) return false;
+        disableInterrupts(ctx);
+        if (!unregisterInterrupts(ctx)) return false;
+    }
+    if (!releaseDriverWork(ctx)) return false;
     clearBdl();
 
     var i: usize = 0;
@@ -480,6 +707,10 @@ fn serviceStatus(ctx: *const r4os.r4dev.DriverContext) void {
     const snapshot = ctx.portInl(state.nabm_port + PO_CIV);
     const civ: usize = @intCast(snapshot & 0x1F);
     const sr: u16 = @truncate(snapshot >> 16);
+    serviceStatusSnapshot(ctx, civ, sr);
+}
+
+fn serviceStatusSnapshot(ctx: *const r4os.r4dev.DriverContext, civ: usize, sr: u16) void {
     _ = state.queue.observe(civ, (sr & SR_CELV) != 0);
     state.last_status = sr;
     if ((sr & SR_BCIS) != 0) state.status_irq_count += 1;
@@ -487,6 +718,7 @@ fn serviceStatus(ctx: *const r4os.r4dev.DriverContext) void {
     if ((sr & SR_FIFOE) != 0) {
         state.fifo_error_count += 1;
         state.underrun_count += 1;
+        @atomicStore(bool, &state.recovery_pending, true, .release);
     }
     const halted = (sr & SR_DCH) != 0;
     if (halted and !state.dch_active) {

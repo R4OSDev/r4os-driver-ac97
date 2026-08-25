@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.4`
+- Version: `0.1.5`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -34,6 +34,10 @@ queue backed by the controller's 32-entry descriptor ring. Busy is reported
 before conversion when that queue lacks space, so retries neither reset nor
 duplicate retained resampler progress. CIV/CELV refresh the current queue
 fill; normal LVBCI and DCH completion states are not reported as underruns.
+PCM-out interrupts use MSI when available and routed INTx otherwise. Status
+and recovery run as one bounded DriverApi-v20 audio pass with a 10 ms absolute
+deadline, stable AC97 key, and at most one successor. Shutdown releases the
+stream lock before joining every completion and freeing DMA.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`.
 Source-transfer provenance is recorded in `PROVENANCE.txt`.
