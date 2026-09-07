@@ -509,6 +509,8 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
             state.resampler_state = resampler_before;
             return finishWrite(-3, write_start);
         };
+        // The SDK copies native 48-kHz stereo S16 blocks directly into the
+        // reserved DMA slot; other formats retain the streaming converter.
         const converted = pcm.convertStreamingToStereoS16(&state.resampler_state, input, rate, channels, format, out);
         if (converted == 0) {
             if (state.resampler_state.chunk_done) break;
