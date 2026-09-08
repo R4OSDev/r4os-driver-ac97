@@ -339,9 +339,11 @@ fn statusWork(raw_context: usize) callconv(.c) i32 {
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     releaseCompletedWork(&ctx);
     const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
-    const pending_status = @atomicRmw(u16, &s.irq_pending_status, .Xchg, 0, .acq_rel);
+    var completed = false;
     if (!@atomicLoad(bool, &s.shutting_down, .acquire) and tryAcquireStream()) {
         defer releaseStream();
+        completed = true;
+        const pending_status = @atomicRmw(u16, &s.irq_pending_status, .Xchg, 0, .acq_rel);
         const snapshot = ctx.portInl(s.nabm_port + PO_CIV);
         const civ: usize = @intCast(snapshot & 0x1F);
         const current_status: u16 = @truncate(snapshot >> 16);
@@ -354,7 +356,7 @@ fn statusWork(raw_context: usize) callconv(.c) i32 {
             }
         }
     }
-    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down) == .resubmit) scheduleStatusWork(s);
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, completed) == .resubmit) scheduleStatusWork(s);
     return 0;
 }
 
