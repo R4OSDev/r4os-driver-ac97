@@ -1,6 +1,16 @@
 ﻿AC97.R4D 0.1.5
 ================
 
+0.87.56: IRQ-Abmeldung muss echte Freigabe quittieren. Nicht quittierte
+Routen bleiben registriert/retiring und behalten Kontext, MSI-Identitaet und
+benoetigte DMA-Ressourcen. Shutdown/Backend geben fehlende Quittungen weiter;
+kein Freigabeerfolg aus dem blossen Abmeldeversuch. Hostqualifikation und
+finale KVM4-/native16-IRQowner-/FPU-/Audio-/Rebootfaelle abgeschlossen.
+AC97/RTL8139 sind zusaetzlich echte KVM-Geraetefaelle; RTL8168/HDA nativ.
+Keine separate native Modulunload-/physische Sicht-/Hoer-/Latenzquittung.
+Genau1finalSTANDARD56 lokal+R4OSServer vollstaendig validiert.
+Zentraler Beleg: Core/Parallelitaet.txt.56.
+
 AC97.R4D ist der ladbare AC97-Hardware-Ausgabetreiber. Er besitzt PCI-Suche,
 Codec-Setup, DMA und den AC97-spezifischen PCM-Backendpfad; der Kernel stellt
 nur die gemeinsame R4DEV- und AudioBackend-Grenze bereit.

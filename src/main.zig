@@ -265,15 +265,21 @@ fn disableInterrupts(ctx: *const r4os.r4dev.DriverContext) void {
 
 fn unregisterInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
     const used_msi = state.irq_mode == 2;
+    var remaining: usize = 0;
     var index: usize = 0;
     while (index < state.irq_route_count) : (index += 1) {
         const route = state.irq_routes[index];
-        if (route < 32) _ = ctx.irqUnregister(route, irqHandler, @intFromPtr(&state));
+        if (route >= 32 or ctx.irqUnregister(route, irqHandler, @intFromPtr(&state)) != 0) {
+            state.irq_routes[remaining] = route;
+            remaining += 1;
+        }
     }
-    state.irq_registered = false;
-    state.irq_route_count = 0;
-    state.irq_mode = 0;
+    @memset(state.irq_routes[remaining..], 0xFF);
+    state.irq_route_count = remaining;
+    state.irq_registered = remaining != 0;
+    if (remaining != 0) return false;
     if (used_msi and ctx.pciDisableMsi(state.info) != 0) return false;
+    state.irq_mode = 0;
     return true;
 }
 
