@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.11`
+- Version: `0.1.12`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -97,3 +97,9 @@ One immutable connector uses generation1 for this exact Core registration;
 shutdown returns Busy and never reasserts availability. A later registration
 has a new Core identity. The explicit board INTx option, IRQ/refill/idle paths
 and original audio progress/drain oracles are unchanged.
+
+R4OS0.88.59 removes only the unused write/refill duration bookkeeping.
+The fixed128-byte AudioBackendStatus duration slots now return the explicit
+Contract0.64.61 audio_duration_ticks_unavailable sentinel (UINT64_MAX).
+Functional clocks/deadlines, PCM admission, DMA/IRQ progress, errors and
+actual terminal Close remain in place. Never treat the sentinel as latency.

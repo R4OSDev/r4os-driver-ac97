@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .Debug,
     });
     callback_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
-    const callback_tests = b.addTest(.{ .root_module = callback_module, .filters = &.{"AC97 "} });
+    const callback_tests = b.addTest(.{ .root_module = callback_module, .filters = &.{ "AC97 ", "retired PCM detail timing" } });
     test_step.dependOn(&b.addRunArtifact(callback_tests).step);
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_queue_tests.step);
