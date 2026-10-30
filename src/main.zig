@@ -536,6 +536,11 @@ fn registerPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
         return false;
     }
     state.backend_registered = true;
+    state.last_result = ctx.registerAudioOutputEpoch("AC97", outputEpoch);
+    if (state.last_result != 0) {
+        _ = unregisterPlaybackBackend(ctx);
+        return false;
+    }
     return true;
 }
 
@@ -557,6 +562,14 @@ fn selectOutput(_: u64, index: u32) callconv(.c) i32 {
 
 fn activeOutput(_: u64) callconv(.c) i32 {
     return if (@atomicLoad(bool, &state.present, .acquire) and !@atomicLoad(bool, &state.shutting_down, .acquire)) 0 else -1;
+}
+
+fn outputEpoch(_: u64, out: *r4os.abi.AudioOutputEpoch) callconv(.c) i32 {
+    // One immutable connector during this registration. Shutdown is terminal,
+    // never a second valid generation pretending to be the live connector.
+    if (!@atomicLoad(bool, &state.present, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire)) return r4os.abi.service_api_result_busy;
+    out.* = .{ .generation = 1, .count = 1, .active_index = 0 };
+    return 1;
 }
 
 fn unregisterPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -1028,7 +1041,8 @@ const IdleCallbackProbe = struct {
     var dma: [DMA_BUFFER_COUNT][MAX_DMA_BYTES]u8 = undefined;
     fn reset() void {
         api = undefined;
-        api.version = a.driver_api_continuation_work_version;
+        api.magic = a.driver_magic;
+        api.version = a.driver_api_version;
         api.size = @sizeOf(a.DriverApi);
         api.tick_count = tick;
         api.timer_frequency = frequency;
@@ -1045,6 +1059,7 @@ const IdleCallbackProbe = struct {
         api.driver_completion_release = release;
         api.driver_completion_wait = completionWait;
         api.register_audio_output_backend = register;
+        api.register_audio_output_epoch = registerEpoch;
         api.log_info = log;
         api.log_warn = log;
         api.log_error = log;
@@ -1133,6 +1148,11 @@ const IdleCallbackProbe = struct {
     fn register(_: [*:0]const u8, descriptor: *const anyopaque) callconv(.c) i32 {
         const value: *const r4os.r4dev.AudioOutputIdleBackend = @ptrCast(@alignCast(descriptor));
         return if (value.base.base.version == a.audio_backend_idle_version and value.base.base.size == 104 and value.idle != null) 0 else -1;
+    }
+    fn registerEpoch(_: [*:0]const u8, callback: a.AudioOutputEpochFn) callconv(.c) i32 {
+        var epoch: a.AudioOutputEpoch = .{};
+        if (callback(0, &epoch) != 1) return -1;
+        return if (epoch.generation == 1 and epoch.count == 1 and epoch.active_index == 0) 0 else -1;
     }
     fn turn(handle: u32) i32 {
         slots[handle].state = a.driver_work_state_running;

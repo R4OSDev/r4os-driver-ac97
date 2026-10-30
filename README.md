@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.10`
+- Version: `0.1.11`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -90,3 +90,10 @@ Source-transfer provenance is recorded in `PROVENANCE.txt`.
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`
 and `NOTICE`. Any repository-specific external material is documented in
 `THIRD_PARTY_NOTICES.md`.
+# Coherent output catalog (0.88.55)
+
+The existing idle backend binds `AudioOutputEpochFn` through DriverApi39.
+One immutable connector uses generation1 for this exact Core registration;
+shutdown returns Busy and never reasserts availability. A later registration
+has a new Core identity. The explicit board INTx option, IRQ/refill/idle paths
+and original audio progress/drain oracles are unchanged.
