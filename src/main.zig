@@ -44,7 +44,7 @@ const MAX_RATE: u32 = 192_000;
 const MAX_DMA_BYTES: u32 = 4096;
 const DMA_BUFFER_COUNT: usize = 8;
 const BDL_ENTRY_COUNT: usize = 32;
-const IRQ_ROUTE_CAPACITY: usize = 9;
+const IRQ_ROUTE_CAPACITY: usize = 1;
 const WORK_HANDLE_CAPACITY: usize = 2;
 const REFILL_DEADLINE_MS: u64 = 10;
 const REFILL_BUDGET_MS: u64 = 2;
@@ -244,9 +244,13 @@ fn setupInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
     }
 
     if (!state.irq_registered) {
-        if (state.info.interrupt_line < 32) _ = registerIrqRoute(ctx, state.info.interrupt_line);
-        var gsi: u8 = 16;
-        while (gsi < 24) : (gsi += 1) _ = registerIrqRoute(ctx, gsi);
+        // PCI Line is a legacy PIC assignment, not an ACPI _PRT/GSI result.
+        // The board configuration must supply the exact INTx route.
+        if (configuredIntxRoute(ctx)) |route| {
+            _ = registerIrqRoute(ctx, route);
+        } else {
+            ctx.logError("AC97.R4D INTx needs a valid PCI pin and OPTION AC97 intx-gsi=<0..31>");
+        }
         if (state.irq_route_count > 0) {
             state.irq_registered = true;
             state.irq_mode = 1;
@@ -257,6 +261,18 @@ fn setupInterrupts(ctx: *const r4os.r4dev.DriverContext) bool {
     ctx.portOutw(state.nabm_port + PO_SR, SR_CLEAR);
     ctx.portOutb(state.nabm_port + PO_CR, (ctx.portInb(state.nabm_port + PO_CR) & ~CR_RUN) | CR_IRQ_ENABLE);
     return true;
+}
+
+fn configuredIntxRoute(ctx: *const r4os.r4dev.DriverContext) ?u8 {
+    if (state.info.interrupt_pin < 1 or state.info.interrupt_pin > 4) return null;
+    const value = std.mem.span(ctx.getOption("AC97", "intx-gsi"));
+    if (value.len == 0 or value.len > 2) return null;
+    var route: u8 = 0;
+    for (value) |digit| {
+        if (digit < '0' or digit > '9') return null;
+        route = route * 10 + (digit - '0');
+    }
+    return if (route < 32) route else null;
 }
 
 fn registerIrqRoute(ctx: *const r4os.r4dev.DriverContext, route: u8) bool {
@@ -1292,6 +1308,251 @@ test "AC97 idle physical Work join releases both owners and retains timed out re
     try t.expect(!state.stream_lock and !state.work_reap_gate);
 }
 
+// Host adapter exercises the real registration, teardown and W1C callbacks.
+// It is unreachable from the normal module exports.
+const InterruptProbe = struct {
+    const a = r4os.abi;
+    var requested: [32]u8 = undefined;
+    var flags: [32]u32 = undefined;
+    var requests: usize = 0;
+    var removed: [32]u8 = undefined;
+    var removals: usize = 0;
+    var live: [32]bool = .{false} ** 32;
+    var msi: i32 = -1;
+    var disable_result: i32 = 0;
+    var disables: usize = 0;
+    var fail_route: u8 = 0xFF;
+    var fail_remove = false;
+    var status_submits: usize = 0;
+    var foreign_pending = false;
+    var foreign_acks: usize = 0;
+    var configured: [*:0]const u8 = "23";
+    fn reset(line: u8, pin: u8) void {
+        IdleCallbackProbe.reset();
+        state.info.interrupt_line = line;
+        state.info.interrupt_pin = pin;
+        const api = &IdleCallbackProbe.api;
+        api.pci_enable_msi = enableMsi;
+        api.pci_disable_msi = disableMsi;
+        api.irq_register = register;
+        api.irq_unregister = unregister;
+        api.get_option = option;
+        api.driver_work_submit = submit;
+        api.driver_work_submit_request = submitRequest;
+        requests = 0;
+        removals = 0;
+        live = .{false} ** 32;
+        msi = -1;
+        disable_result = 0;
+        disables = 0;
+        fail_route = 0xFF;
+        fail_remove = false;
+        status_submits = 0;
+        foreign_pending = false;
+        foreign_acks = 0;
+        configured = "23";
+    }
+    fn option(driver: [*:0]const u8, key: [*:0]const u8) callconv(.c) [*:0]const u8 {
+        std.debug.assert(std.mem.eql(u8, std.mem.span(driver), "AC97") and std.mem.eql(u8, std.mem.span(key), "intx-gsi"));
+        return configured;
+    }
+    fn enableMsi(_: u8, _: u8, _: u8, _: u8) callconv(.c) i32 {
+        return msi;
+    }
+    fn disableMsi(_: u8, _: u8, _: u8, _: u8) callconv(.c) i32 {
+        disables += 1;
+        return disable_result;
+    }
+    fn register(irq: u8, handler: a.IrqHandler, raw: usize, value: u32) callconv(.c) i32 {
+        std.debug.assert(handler == irqHandler and raw == @intFromPtr(&state));
+        requested[requests] = irq;
+        flags[requests] = value;
+        requests += 1;
+        if (irq == fail_route) return -1;
+        live[irq] = true;
+        return 0;
+    }
+    fn unregister(irq: u8, handler: a.IrqHandler, raw: usize) callconv(.c) i32 {
+        std.debug.assert(handler == irqHandler and raw == @intFromPtr(&state) and live[irq]);
+        removed[removals] = irq;
+        removals += 1;
+        if (fail_remove) return -1;
+        live[irq] = false;
+        return 0;
+    }
+    fn submit(handler: a.DriverWorkHandler, raw: usize, value: u32, out: *u32) callconv(.c) i32 {
+        std.debug.assert(handler == statusWork and raw == @intFromPtr(&state) and value == a.driver_work_flag_from_irq);
+        status_submits += 1;
+        out.* = 1;
+        return 0;
+    }
+    fn submitRequest(request: *const a.DriverWorkRequest, out: *u32) callconv(.c) i32 {
+        std.debug.assert(request.serial_key == @intFromPtr(&state));
+        return submit(request.handler, request.context, request.flags, out);
+    }
+    fn foreignHandler(_: u8, _: usize) callconv(.c) u32 {
+        if (!foreign_pending) return 0;
+        foreign_pending = false;
+        foreign_acks += 1;
+        return a.irq_result_handled;
+    }
+};
+
+test "AC97 IRQ registers only the configured GSI with valid PCI pin and shared level flags" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(11, 1);
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    try t.expectEqual(@as(usize, 1), p.requests);
+    try t.expectEqual(@as(u8, 23), p.requested[0]);
+    try t.expectEqual(r4os.abi.irq_flag_shared | r4os.abi.irq_flag_level_low, p.flags[0]);
+    try t.expectEqual(@as(usize, 1), state.irq_route_count);
+    try t.expectEqual(@as(u8, 1), state.irq_mode);
+    try t.expectEqual(CR_IRQ_ENABLE, IdleCallbackProbe.cr & (CR_IRQ_ENABLE | CR_RUN));
+}
+
+test "AC97 IRQ missing or malformed GSI and missing pin never admit raw Line or neighbors" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    for ([_][*:0]const u8{ "", "32", "99", "256", "023", "-1", "+1", "1x", " 1", "1 ", "auto" }) |value| {
+        p.reset(11, 1);
+        p.configured = value;
+        const ctx = context();
+        try t.expect(!setupInterrupts(&ctx));
+        try t.expectEqual(@as(usize, 0), p.requests);
+        try t.expectEqual(@as(usize, 0), state.irq_route_count);
+        try t.expect(!state.irq_registered);
+        try t.expectEqual(@as(u8, 0), IdleCallbackProbe.cr & CR_IRQ_ENABLE);
+    }
+    for ([_]u8{ 0, 5, 0xFF }) |pin| {
+        p.reset(11, pin);
+        const ctx = context();
+        try t.expect(!setupInterrupts(&ctx));
+        try t.expectEqual(@as(usize, 0), p.requests);
+    }
+    // A board GSI does not depend on a legacy PIC Line being assigned.
+    p.reset(0xFF, 4);
+    p.configured = "31";
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{31}, p.requested[0..p.requests]);
+}
+
+test "AC97 IRQ failed exact registration cannot succeed through unrelated GSIs" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(19, 4);
+    p.configured = "19";
+    p.fail_route = 19;
+    const ctx = context();
+    try t.expect(!setupInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{19}, p.requested[0..p.requests]);
+    try t.expect(!state.irq_registered);
+    try t.expectEqual(@as(usize, 0), state.irq_route_count);
+}
+
+test "AC97 IRQ successful MSI needs no INTx evidence or fallback registration" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(0xFF, 0);
+    p.msi = 23;
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{23}, p.requested[0..p.requests]);
+    try t.expectEqual(r4os.abi.irq_flag_msi, p.flags[0]);
+    try t.expectEqual(@as(u8, 2), state.irq_mode);
+    try t.expectEqual(@as(usize, 0), p.disables);
+    try t.expect(unregisterInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{23}, p.removed[0..p.removals]);
+    try t.expectEqual(@as(usize, 1), p.disables);
+}
+
+test "AC97 IRQ MSI fallback requires real disable acknowledgement before exact INTx" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(11, 2);
+    p.msi = 23;
+    p.fail_route = 23;
+    p.configured = "19";
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{ 23, 19 }, p.requested[0..p.requests]);
+    try t.expectEqual(@as(usize, 1), p.disables);
+    try t.expectEqual(@as(u8, 1), state.irq_mode);
+    try t.expectEqual(@as(u8, 19), state.irq_routes[0]);
+    p.reset(11, 2);
+    p.msi = 23;
+    p.fail_route = 23;
+    p.disable_result = -1;
+    const blocked = context();
+    try t.expect(!setupInterrupts(&blocked));
+    try t.expectEqualSlices(u8, &.{23}, p.requested[0..p.requests]);
+    try t.expectEqual(@as(u8, 2), state.irq_mode);
+    try t.expect(!state.irq_registered);
+}
+
+test "AC97 IRQ out of range MSI is disabled and missing INTx still refuses admission" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(0xFF, 0);
+    p.msi = 32;
+    p.configured = "";
+    const ctx = context();
+    try t.expect(!setupInterrupts(&ctx));
+    try t.expectEqual(@as(usize, 1), p.disables);
+    try t.expectEqual(@as(usize, 0), p.requests);
+}
+
+test "AC97 IRQ failed unregister and MSI disable retain exact retry evidence" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(11, 1);
+    p.msi = 23;
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    p.fail_remove = true;
+    try t.expect(!unregisterInterrupts(&ctx));
+    try t.expect(state.irq_registered and p.live[23]);
+    try t.expectEqual(@as(usize, 1), state.irq_route_count);
+    try t.expectEqual(@as(usize, 0), p.disables);
+    p.fail_remove = false;
+    p.disable_result = -1;
+    try t.expect(!unregisterInterrupts(&ctx));
+    try t.expect(!state.irq_registered and !p.live[23]);
+    try t.expectEqual(@as(usize, 0), state.irq_route_count);
+    try t.expectEqual(@as(u8, 2), state.irq_mode);
+    p.disable_result = 0;
+    try t.expect(unregisterInterrupts(&ctx));
+    try t.expectEqualSlices(u8, &.{ 23, 23 }, p.removed[0..p.removals]);
+    try t.expectEqual(@as(u8, 0), state.irq_mode);
+}
+
+test "AC97 IRQ actual shared callbacks acknowledge only their own W1C status" {
+    const t = std.testing;
+    const p = InterruptProbe;
+    p.reset(11, 1);
+    const ctx = context();
+    try t.expect(setupInterrupts(&ctx));
+    p.foreign_pending = true;
+    IdleCallbackProbe.sr = SR_DCH | SR_CELV;
+    try t.expectEqual(@as(u32, 0), irqHandler(23, @intFromPtr(&state)));
+    try t.expectEqual(r4os.abi.irq_result_handled, p.foreignHandler(23, 0));
+    try t.expectEqual(@as(usize, 1), p.foreign_acks);
+    try t.expectEqual(@as(usize, 0), p.status_submits);
+    try t.expectEqual(@as(u64, 1), state.irq_unhandled);
+    IdleCallbackProbe.sr |= SR_LVBCI | SR_BCIS;
+    try t.expectEqual(r4os.abi.irq_result_handled, irqHandler(23, @intFromPtr(&state)));
+    try t.expectEqual(@as(u16, SR_DCH | SR_CELV), IdleCallbackProbe.sr);
+    try t.expectEqual(@as(u16, SR_LVBCI | SR_BCIS), state.irq_pending_status);
+    try t.expectEqual(@as(u8, 23), state.irq_active_route);
+    try t.expectEqual(@as(usize, 1), p.status_submits);
+    try t.expectEqual(@as(u64, 1), state.irq_count);
+    try t.expectEqual(@as(u32, 0), irqHandler(23, @intFromPtr(&state)));
+    try t.expectEqual(@as(usize, 1), p.status_submits);
+    try t.expectEqual(@as(u32, 0), p.foreignHandler(23, 0));
+}
+
 fn setLastResult(result: i32) i32 {
     state.last_result = result;
     if (result == r4os.abi.service_api_result_busy) {
@@ -1332,6 +1593,10 @@ fn logDevice(ctx: *const r4os.r4dev.DriverContext, info: r4os.abi.PciDeviceInfo)
     appendHex(&line, &len, info.vendor_id, 4);
     appendText(&line, &len, " device=0x");
     appendHex(&line, &len, info.device_id, 4);
+    appendText(&line, &len, " line=");
+    appendDec(&line, &len, info.interrupt_line);
+    appendText(&line, &len, " pin=");
+    appendDec(&line, &len, info.interrupt_pin);
     logLine(ctx, &line, len);
 }
 

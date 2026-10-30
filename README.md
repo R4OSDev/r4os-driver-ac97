@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.9`
+- Version: `0.1.10`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -34,7 +34,20 @@ queue backed by the controller's 32-entry descriptor ring. Busy is reported
 before conversion when that queue lacks space, so retries neither reset nor
 duplicate retained resampler progress. CIV/CELV refresh the current queue
 fill; normal LVBCI and DCH completion states are not reported as underruns.
-PCM-out interrupts use MSI when available and routed INTx otherwise. Status
+PCM-out interrupts use MSI when available. INTx requires a valid PCI interrupt
+pin and an explicitly supplied board route: `OPTION AC97 intx-gsi=N`, with
+one or two decimal digits in the range 0..31. The raw PCI Line is a legacy PIC
+assignment and does not establish an APIC GSI. Missing/invalid configuration
+or a failed registration refuses admission with an error; no neighboring
+GSIs are guessed. MSI does not require this option. If MSI registration fails,
+MSI disable must succeed before an INTx fallback is attempted. There is no
+automatic ACPI `_PRT` resolver in the current DriverApi.
+
+Supply `N` from the actual board/firmware routing contract. For the qualified
+Q35 arrangement with AC97 at 00:03.0, pin A, the observed route is GSI 23;
+this is an example for that topology, not a general R4OS/AC97 default. The
+driver owns one successful route and retains failed unregister/disable
+acknowledgements for retry before resource release. Status
 and recovery run as one bounded DriverApi-v20 audio pass with a 10 ms absolute
 deadline, stable AC97 key, and at most one successor. Shutdown releases the
 stream lock before joining every completion and freeing DMA.
@@ -58,8 +71,10 @@ the real tickets retire. Genuine reset, deadline and release errors remain
 failures with retained resource truth. The existing continuation API is
 required; no Kernel, SDK or public Query-table change is needed.
 
-The existing owner step passes19 cases: seven original queue/Work cases,
-six drain-state cases and six actual descriptor/Idle/Work/write callback cases.
+The existing owner step passes27 cases: seven original queue/Work cases,
+six drain-state cases, six actual descriptor/Idle/Work/write callback cases
+and eight actual IRQ registration/teardown/shared-W1C cases. The original
+AC979 source fails five targeted route cases; the explicit-route source passes.
 An actual KVM4 comparison uses the identical retained8032-byte Close/master
 fixture: the independent master request returns while final Close is pending,
 then Close and its IO/connection retirement succeed. Original BEEP and AUDIOD

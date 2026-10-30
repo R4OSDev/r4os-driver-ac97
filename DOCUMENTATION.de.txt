@@ -1,5 +1,29 @@
-﻿AC97.R4D 0.1.9
+﻿AC97.R4D 0.1.10
 ================
+
+0.88.51: INTx braucht eine ausdrueckliche Boardroute:
+
+    OPTION AC97 intx-gsi=N
+
+N besteht aus einer oder zwei Dezimalziffern und liegt zwischen0und31.
+Zusaetzlich muss der PCI-Interruptpin1..4 sein. Der rohe PCI-Linewert ist
+eine Legacy-PIC-Zuweisung und wird nicht als APIC-GSI geraten. Ohne gueltige
+Route oder bei verweigerter Registrierung wird der Treiber mit klarer
+Fehlermeldung nicht aufgenommen. Es werden keine benachbarten GSI16..23
+mitregistriert. MSI bleibt zuerst; eine verweigerte MSI-Registrierung darf
+erst nach bestaetigter MSI-Deaktivierung auf die Boardroute zurueckfallen.
+MSI benoetigt diese Option nicht. Genau eine erfolgreiche eigene Route wird
+gespeichert. Verweigerte Abmeldung/MSI-Deaktivierung behaelt die bisherigen
+Quittungs- und Retryregeln vor Work-/DMA-/Modulfreigabe.
+
+N aus dem tatsaechlichen Board-/Firmwarevertrag bestimmen. Die qualifizierte
+Q35-Anordnung mit AC97 an00:03.0/PinA benutzt GSI23; das ist kein allgemeiner
+AC97-/R4OS-Standard. DriverApi hat derzeit keinen automatischen _PRT-Resolver.
+Der verworfene Line-only-Ansatz lieferte unter echter gemeinsamer IRQ-Last
+keinen zuverlaessigen asynchronen AUDIOD-Nachweis. Die Originalorakel bleiben
+unveraendert.27Ownerfaelle bestehen; alterAC979-Code scheitert an fuenf der
+acht neuen echten Registrierungs-/Abmelde-/MSI-/Shared-W1C-Callbackfaelle.
+Aktuelle native Belege stehen zentral unter Docs/Audio/README.txt.
 
 0.88.50: Normaler Idle/letzter Stream-Close nutzt den vorhandenen V4-Idle-
 Deskriptortail (104Bytes) mit dem unveraenderten Ausgabenamen und der ID AC97.
