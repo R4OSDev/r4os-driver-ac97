@@ -1,5 +1,39 @@
-﻿AC97.R4D 0.1.5
+﻿AC97.R4D 0.1.9
 ================
+
+0.88.50: Normaler Idle/letzter Stream-Close nutzt den vorhandenen V4-Idle-
+Deskriptortail (104Bytes) mit dem unveraenderten Ausgabenamen und der ID AC97.
+Ein residentes normales Workticket erhaelt Output-/Reset-/PCI-Identitaet und
+die vor Submission beginnende absolute2000ms-Drainfrist. Der Callback liefert
+Busy bis zu tatsaechlich leerer PCM-Queue und DCH, bestaetigtem Hardware-Reset,
+wirklichem Ende/Freigabe der Statusarbeit sowie terminaler eigener Completion
+und deren Freigabe. Die anschliessende Statusretirementfrist bleibt100ms.
+Pro Turn wird nur ein begrenzter Fortschritt ausgefuehrt; der reale Streamowner
+ist vor Rueckgabe von driver_work_result_wait frei. Der Kernel setzt dasselbe
+Continuationticket fort. Es gibt keine neue Deadlinearbeit, Warte-Task oder
+Callerpointerhaltung. IRQ-Statusadmission wird vor Retirement geschlossen;
+ausstehende Submitter und echte Handles werden zuerst quittiert. Abgebrochene
+Queuearbeit fuehrt keinen finishPass aus: deren Pendingbuchhaltung wird erst
+nach allen realen Freigaben aufgeraeumt. Neue angenommene PCM-Daten verwerfen
+die alte Absicht; fehlerhafte/Busy Writes tun das nicht. Eine alte Completion
+quittiert keinen neuen PCM-Lauf. Echte Fehler werden auch ohne weiter wartenden
+Client erfasst; fehlende Hardware-/Workquittungen bleiben Fehler und behalten
+die Ressourcen. Physischer Stop/Shutdown und normaler Idle bleiben getrennt.
+Physische Workjoins halten weder Streamowner noch Reapergate. Die bestehenden
+AUDSVC-/Callerfristen werden nicht verlaengert; eine auslaufende RPC-Frist ist
+kein Hardware- oder Workabschluss. Die vorhandene Continuation-API ist noetig,
+Kernel426/SDK114/Contract59 bleiben unveraendert.
+
+19Hostfaelle im vorhandenen Teststep bestehen:7bisherige Queue-/Workfaelle,
+6Drainzustandsfaelle und6echte Main-Callbackfaelle mit Host-Port-/Workadaptern.
+Der Pendingfall fuer abgebrochene Statusarbeit scheitert vor der Korrektur
+und besteht danach. KVM4 bestaetigt exakte AC979Bytes, denselben eingefrorenen
+8032Byte-Close/Masterfall vor/nach: Masterantwort nun bei noch laufendem Close,
+danach echter Close0 und IO-/Verbindungsfreigabe. OriginalBEEP/AUDIOD8280/
+Master/Restart/4Close und ein ohne Close beendeter Client mit tatsaechlicher
+generationengebundener AUDSVC-Bereinigung bestehen. Physische Hoer-/Latenz-
+abnahme und native Hardwarefehlerinjektion werden nicht behauptet.
+Zentrale aktuelle Belege: Docs/Audio/README.txt, Abschnitt0.88.50.
 
 0.87.56: IRQ-Abmeldung muss echte Freigabe quittieren. Nicht quittierte
 Routen bleiben registriert/retiring und behalten Kontext, MSI-Identitaet und
@@ -72,9 +106,11 @@ Stand 0.69.42:
 - Ein Callback verarbeitet genau einen Status-/Recoverydurchlauf. Eine
   waehrenddessen veraenderte IRQ-Generation erzeugt hoechstens einen neuen
   Successor mit eigener Deadline; zwei Handles begrenzen den Uebergang.
-- Stop und Shutdown sperren die Interruptquelle, melden IRQ/MSI ab, geben den
-  Stream-Lock frei und joinen anschliessend alle Completionhandles, bevor DMA
-  freigegeben wird. FIFO-Fehler bleiben als Underrun und Recovery sichtbar.
+- Physischer Stop setzt den DMA-Controller zurueck und behaelt die IRQ-Routen
+  fuer erneute PCM-Daten. Shutdown deaktiviert und meldet IRQ/MSI ab. Beide
+  geben den Stream-Lock vor den realen Workjoins frei; Shutdown gibt DMA erst
+  nach diesen Quittungen frei. FIFO-Fehler bleiben als Underrun und Recovery
+  sichtbar.
 - BDL, acht 4.096-Byte-DMA-Puffer und Periodengeometrie bleiben unveraendert,
   weil Cursor-, Queue-, Unterlauf- und Deadlinewerte keine Segment-DMA-
   Aenderung rechtfertigten.

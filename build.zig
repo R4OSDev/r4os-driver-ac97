@@ -28,6 +28,21 @@ pub fn build(b: *std.Build) void {
     const run_work_gate_tests = b.addRunArtifact(work_gate_tests);
 
     const test_step = b.step("test", "Run AC97 descriptor queue ownership tests");
+    const idle_module = b.createModule(.{
+        .root_source_file = b.path("src/idle_drain.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    const idle_tests = b.addTest(.{ .root_module = idle_module });
+    test_step.dependOn(&b.addRunArtifact(idle_tests).step);
+    const callback_module = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    callback_module.addImport("r4os", sdk.createR4osModule(b.graph.host, .Debug));
+    const callback_tests = b.addTest(.{ .root_module = callback_module, .filters = &.{"AC97 idle"} });
+    test_step.dependOn(&b.addRunArtifact(callback_tests).step);
     test_step.dependOn(b.getInstallStep());
     test_step.dependOn(&run_queue_tests.step);
     test_step.dependOn(&run_work_gate_tests.step);

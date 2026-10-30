@@ -1,7 +1,9 @@
 const r4os = @import("r4os");
+const std = @import("std");
 const pcm = r4os.audio_pcm;
 const queue_state = @import("queue_state.zig");
 const work_gate = @import("work_gate.zig");
+const idle_drain = @import("idle_drain.zig");
 
 comptime {
     asm (r4os.r4dev.driverEntriesAsm("ac97_init", "ac97_shutdown"));
@@ -62,7 +64,10 @@ const State = struct {
     info: r4os.abi.PciDeviceInfo = .{},
     nam_port: u16 = 0,
     nabm_port: u16 = 0,
-    backend: r4os.abi.AudioBackend = .{},
+    backend: r4os.r4dev.AudioOutputIdleBackend = .{
+        .base = .{ .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput } },
+        .idle = idlePlaybackBackend,
+    },
     backend_registered: bool = false,
     present: bool = false,
     stream_lock: bool = false,
@@ -115,6 +120,15 @@ const State = struct {
     irq_pending_status: u16 = 0,
     work_pending: bool = false,
     work_handles: [WORK_HANDLE_CAPACITY]u32 = .{0} ** WORK_HANDLE_CAPACITY,
+    work_reap_gate: bool = false,
+    status_stopped: bool = false,
+    status_submitters: u32 = 0,
+    synchronous_stop: bool = false,
+    output_epoch: u64 = 1,
+    idle_close: idle_drain.State = .{},
+    idle_close_handle: u32 = 0,
+    idle_close_result: enum { none, pending, success, failed } = .none,
+    idle_close_epoch: idle_drain.Identity = .{ .output = 0, .reset = 0, .pci = 0 },
     recovery_pending: bool = false,
     resampler_state: pcm.ResamplerState = .{},
 };
@@ -132,7 +146,7 @@ fn msTicks(ctx: *const r4os.r4dev.DriverContext, ms: u64) u64 {
 export fn ac97_init(api: *const r4os.r4dev.DriverApi) callconv(.c) i32 {
     state = .{ .api = api };
     var ctx = context();
-    if (!ctx.apiCompatible()) return -10;
+    if (!ctx.apiCompatible() or api.version < r4os.abi.driver_api_continuation_work_version) return -10;
     ctx.logInfo("AC97.R4D init");
 
     const info = findDevice(&ctx) orelse {
@@ -305,6 +319,11 @@ fn irqHandler(irq: u8, raw_context: usize) callconv(.c) u32 {
 }
 
 fn scheduleStatusWork(s: *State) void {
+    if (@atomicLoad(bool, &s.status_stopped, .acquire)) return;
+    _ = @atomicRmw(u32, &s.status_submitters, .Add, 1, .acq_rel);
+    defer _ = @atomicRmw(u32, &s.status_submitters, .Sub, 1, .release);
+    // Retirement closes admission before observing this in-flight count.
+    if (@atomicLoad(bool, &s.status_stopped, .acquire)) return;
     if (@atomicRmw(bool, &s.work_pending, .Xchg, true, .acq_rel)) return;
     const ctx = r4os.r4dev.DriverContext.init(s.api);
     releaseCompletedWork(&ctx);
@@ -346,7 +365,7 @@ fn statusWork(raw_context: usize) callconv(.c) i32 {
     releaseCompletedWork(&ctx);
     const observed_generation = @atomicLoad(u64, &s.irq_generation, .acquire);
     var completed = false;
-    if (!@atomicLoad(bool, &s.shutting_down, .acquire) and tryAcquireStream()) {
+    if (!@atomicLoad(bool, &s.shutting_down, .acquire) and !@atomicLoad(bool, &s.status_stopped, .acquire) and tryAcquireStream()) {
         defer releaseStream();
         completed = true;
         const pending_status = @atomicRmw(u16, &s.irq_pending_status, .Xchg, 0, .acq_rel);
@@ -362,11 +381,13 @@ fn statusWork(raw_context: usize) callconv(.c) i32 {
             }
         }
     }
-    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.shutting_down, completed) == .resubmit) scheduleStatusWork(s);
+    if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.status_stopped, completed) == .resubmit) scheduleStatusWork(s);
     return 0;
 }
 
 fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext) void {
+    if (!tryAcquireReaper()) return;
+    defer releaseReaper();
     for (&state.work_handles) |*stored| {
         const handle = @atomicLoad(u32, stored, .acquire);
         if (handle == 0) continue;
@@ -378,27 +399,63 @@ fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext) void {
 }
 
 fn releaseDriverWork(ctx: *const r4os.r4dev.DriverContext) bool {
+    @atomicStore(bool, &state.status_stopped, true, .release);
     @atomicStore(bool, &state.work_pending, false, .release);
     @atomicStore(u16, &state.irq_pending_status, 0, .release);
     var quiesced = true;
-    for (&state.work_handles) |*stored| {
-        const handle = @atomicLoad(u32, stored, .acquire);
-        if (handle == 0) continue;
-        var status: r4os.abi.DriverCompletionStatus = .{};
-        if (ctx.completionStatus(handle, &status) == 0 and status.state == r4os.abi.driver_work_state_queued) _ = ctx.workCancel(handle);
-        var result: i32 = 0;
-        const wait_result = ctx.completionWait(handle, msTicks(ctx, PLAYBACK_WAIT_MS), &result);
-        if (wait_result != 0 and wait_result != r4os.abi.driver_work_result_cancelled) {
-            quiesced = false;
-            continue;
-        }
-        if (ctx.completionRelease(handle) == 0) {
-            @atomicStore(u32, stored, 0, .release);
+    const until = ctx.tickCount() +| msTicks(ctx, PLAYBACK_WAIT_MS);
+    while (@atomicLoad(u32, &state.status_submitters, .acquire) != 0) {
+        if (ctx.tickCount() >= until) return false;
+        ctx.waitTicks(1);
+    }
+    for (&state.work_handles) |*stored| if (!waitAndReleaseWork(ctx, stored)) {
+        quiesced = false;
+    };
+    if (!waitAndReleaseWork(ctx, &state.idle_close_handle)) quiesced = false;
+    return quiesced;
+}
+
+fn tryAcquireReaper() bool {
+    return !@atomicRmw(bool, &state.work_reap_gate, .Xchg, true, .acq_rel);
+}
+
+fn releaseReaper() void {
+    @atomicStore(bool, &state.work_reap_gate, false, .release);
+}
+
+// No stream owner or reaper gate spans completionWait: its worker can need
+// those owners to terminate. A concurrent successful reaper leaves stored=0.
+fn waitAndReleaseWork(ctx: *const r4os.r4dev.DriverContext, stored: *u32) bool {
+    const until = ctx.tickCount() +| msTicks(ctx, PLAYBACK_WAIT_MS);
+    while (true) {
+        if (tryAcquireReaper()) {
+            const handle = @atomicLoad(u32, stored, .acquire);
+            if (handle == 0) {
+                releaseReaper();
+                return true;
+            }
+            var status: r4os.abi.DriverCompletionStatus = .{};
+            const rc = ctx.completionStatus(handle, &status);
+            if (rc != 0) {
+                releaseReaper();
+                return false;
+            }
+            if (status.state == r4os.abi.driver_work_state_completed or status.state == r4os.abi.driver_work_state_cancelled) {
+                const released = ctx.completionRelease(handle) == 0;
+                if (released) @atomicStore(u32, stored, 0, .release);
+                releaseReaper();
+                return released;
+            }
+            if (status.state == r4os.abi.driver_work_state_queued) _ = ctx.workCancel(handle);
+            releaseReaper();
+            if (ctx.tickCount() >= until) return false;
+            var result: i32 = 0;
+            _ = ctx.completionWait(handle, until -| ctx.tickCount(), &result);
         } else {
-            quiesced = false;
+            if (ctx.tickCount() >= until) return false;
+            ctx.waitTicks(1);
         }
     }
-    return quiesced;
 }
 
 fn allocDmaState(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -437,17 +494,26 @@ fn codecReset(ctx: *const r4os.r4dev.DriverContext) void {
 
 fn registerPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
     state.backend = .{
-        .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
-        .min_rate = MIN_RATE,
-        .max_rate = MAX_RATE,
-        .preferred_rate = pcm.TARGET_RATE,
-        .max_channels = pcm.TARGET_CHANNELS,
-        .write_pcm = writePcm,
-        .stop = stopPlaybackBackend,
-        .shutdown = shutdownBackend,
-        .status = backendStatus,
+        .base = .{
+            .base = .{
+                .version = r4os.abi.audio_backend_idle_version,
+                .size = @sizeOf(r4os.r4dev.AudioOutputIdleBackend),
+                .context = &state,
+                .formats = r4os.abi.audio_backend_format_s16le | r4os.abi.audio_backend_format_u8,
+                .min_rate = MIN_RATE,
+                .max_rate = MAX_RATE,
+                .preferred_rate = pcm.TARGET_RATE,
+                .max_channels = pcm.TARGET_CHANNELS,
+                .write_pcm = writePcm,
+                .stop = stopPlaybackBackend,
+                .shutdown = shutdownBackend,
+                .status = backendStatus,
+            },
+            .outputs = .{ .query = queryOutput, .select = selectOutput, .active = activeOutput },
+        },
+        .idle = idlePlaybackBackend,
     };
-    const rc = ctx.registerAudioOutputBackend("AC97", &state.backend);
+    const rc = ctx.registerAudioOutputIdle("AC97", &state.backend);
     state.last_result = rc;
     if (rc != 0) {
         state.error_count += 1;
@@ -455,6 +521,26 @@ fn registerPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
     }
     state.backend_registered = true;
     return true;
+}
+
+fn queryOutput(_: u64, index: u32, out: *r4os.abi.AudioOutputInfo) callconv(.c) i32 {
+    out.* = .{};
+    if (index != 0) return 0;
+    @memcpy(out.id[0..4], "AC97");
+    @memcpy(out.name[0..4], "AC97");
+    out.availability = if (@atomicLoad(bool, &state.present, .acquire) and !@atomicLoad(bool, &state.shutting_down, .acquire)) r4os.abi.audio_output_available else r4os.abi.audio_output_unavailable;
+    out.preferred_rate = pcm.TARGET_RATE;
+    out.channels = pcm.TARGET_CHANNELS;
+    out.format = pcm.FORMAT_S16LE;
+    return 1;
+}
+
+fn selectOutput(_: u64, index: u32) callconv(.c) i32 {
+    return if (index == 0 and activeOutput(0) == 0) 0 else -1;
+}
+
+fn activeOutput(_: u64) callconv(.c) i32 {
+    return if (@atomicLoad(bool, &state.present, .acquire) and !@atomicLoad(bool, &state.shutting_down, .acquire)) 0 else -1;
 }
 
 fn unregisterPlaybackBackend(ctx: *const r4os.r4dev.DriverContext) bool {
@@ -478,8 +564,13 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
     if (!@atomicLoad(bool, &state.present, .acquire) or @atomicLoad(bool, &state.shutting_down, .acquire) or state.nabm_port == 0) return finishWrite(-1, write_start);
     releaseCompletedWork(&ctx);
     if (!tryAcquireStream()) return finishWrite(r4os.abi.service_api_result_busy, write_start);
-    defer releaseStream();
+    defer {
+        releaseStream();
+        if (!@atomicLoad(bool, &state.status_stopped, .acquire) and @atomicLoad(u16, &state.irq_pending_status, .acquire) != 0) scheduleStatusWork(&state);
+    }
     if (@atomicLoad(bool, &state.shutting_down, .acquire)) return finishWrite(-1, write_start);
+    if (@atomicLoad(bool, &state.synchronous_stop, .acquire)) return finishWrite(r4os.abi.service_api_result_busy, write_start);
+    if (state.idle_close_result != .none and state.output_epoch == @import("std").math.maxInt(u64)) return finishWrite(-1, write_start);
     const input = data[0..@as(usize, @intCast(len))];
     if (pcm.outputFrameCount(input.len, rate, channels, format) == 0) return finishWrite(-2, write_start);
     const output_frames = pendingOutputFrames(input.len, rate, channels, format) orelse return finishWrite(-2, write_start);
@@ -503,6 +594,7 @@ fn writePcm(context_arg: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, ch
         state.last_source_format = format;
         state.last_output_frames = 0;
         state.write_count +%= 1;
+        acceptNewPcm();
         return finishWrite(0, write_start);
     }
     var lengths: [DMA_BUFFER_COUNT]usize = .{0} ** DMA_BUFFER_COUNT;
@@ -561,11 +653,139 @@ fn pendingOutputFrames(input_len: usize, rate: u32, channels: u16, format: u16) 
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
     _ = context_arg;
     var ctx = context();
-    if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) return setLastResult(r4os.abi.service_api_result_busy);
+    const was_stopped = @atomicLoad(bool, &state.status_stopped, .acquire);
+    @atomicStore(bool, &state.synchronous_stop, true, .release);
+    @atomicStore(bool, &state.status_stopped, true, .release);
+    if (!acquireStream(&ctx, PLAYBACK_WAIT_MS)) {
+        @atomicStore(bool, &state.synchronous_stop, false, .release);
+        @atomicStore(bool, &state.status_stopped, was_stopped, .release);
+        if (!was_stopped and @atomicLoad(u16, &state.irq_pending_status, .acquire) != 0) scheduleStatusWork(&state);
+        return setLastResult(r4os.abi.service_api_result_busy);
+    }
+    cancelIdleClose();
     const stopped = stopPlayback(&ctx, true);
     releaseStream();
     if (!releaseDriverWork(&ctx)) return setLastResult(-1);
+    if (stopped) @atomicStore(bool, &state.synchronous_stop, false, .release);
     return setLastResult(if (stopped) 0 else -1);
+}
+
+fn cancelIdleClose() void {
+    state.idle_close.reset();
+    state.idle_close_result = .none;
+}
+
+// Called only after a complete successful source acceptance, under stream.
+// Invalid/Busy writes leave the previous close intention and epoch intact.
+fn acceptNewPcm() void {
+    if (state.idle_close_result != .none) {
+        state.output_epoch += 1; // overflow rejected before conversion
+        cancelIdleClose();
+    }
+    @atomicStore(bool, &state.status_stopped, false, .release);
+}
+
+const IdleCloseOwner = struct {
+    ctx: *const r4os.r4dev.DriverContext,
+    pub fn identity(_: *@This()) idle_drain.Identity {
+        return .{ .output = state.output_epoch, .reset = state.reset_count, .pci = (@as(u32, state.info.bus) << 8) | (@as(u32, state.info.device) << 3) | state.info.function };
+    }
+    pub fn now(self: *@This()) u64 {
+        return self.ctx.tickCount();
+    }
+    pub fn pump(self: *@This()) bool {
+        const pending = @atomicRmw(u16, &state.irq_pending_status, .Xchg, 0, .acq_rel);
+        const snapshot = self.ctx.portInl(state.nabm_port + PO_CIV);
+        const sr: u16 = @truncate(snapshot >> 16);
+        serviceStatusSnapshot(self.ctx, @intCast(snapshot & 0x1F), sr | pending);
+        return state.queue.pending == 0 and (sr & SR_DCH) != 0;
+    }
+    pub fn quiet(self: *@This()) bool {
+        @atomicStore(bool, &state.status_stopped, true, .release);
+        return stopPlayback(self.ctx, false);
+    }
+    pub fn retire(self: *@This()) idle_drain.Retirement {
+        if (@atomicLoad(u32, &state.status_submitters, .acquire) != 0 or !tryAcquireReaper()) return .pending;
+        defer releaseReaper();
+        for (&state.work_handles) |*stored| {
+            const handle = @atomicLoad(u32, stored, .acquire);
+            if (handle == 0) continue;
+            var status: r4os.abi.DriverCompletionStatus = .{};
+            if (self.ctx.completionStatus(handle, &status) != 0) return .failed;
+            if (status.state == r4os.abi.driver_work_state_queued) _ = self.ctx.workCancel(handle);
+            if (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled) return .pending;
+            if (self.ctx.completionRelease(handle) != 0) return .pending;
+            @atomicStore(u32, stored, 0, .release);
+        }
+        // A cancelled queued status callback does not execute finishPass.
+        // Restore the original Stop cleanup only after every actual ticket
+        // and in-flight submitter has retired; future PCM can admit work.
+        @atomicStore(bool, &state.work_pending, false, .release);
+        @atomicStore(u16, &state.irq_pending_status, 0, .release);
+        return .complete;
+    }
+};
+
+// The existing continuation flag/result retains one ticket across bounded
+// turns. No client pointer, sleeping lock or audio-deadline job is retained.
+fn idleCloseWork(_: usize) callconv(.c) i32 {
+    if (@atomicLoad(bool, &state.shutting_down, .acquire) or @atomicLoad(bool, &state.synchronous_stop, .acquire)) return 0;
+    if (!tryAcquireStream()) return r4os.abi.driver_work_result_wait;
+    defer releaseStream();
+    if (state.idle_close_result != .pending) return 0;
+    var ctx = context();
+    var owner = IdleCloseOwner{ .ctx = &ctx };
+    const result = state.idle_close.poll(&owner, msTicks(&ctx, PLAYBACK_WAIT_MS));
+    if (result == .pending) return r4os.abi.driver_work_result_wait;
+    if (result == .complete) {
+        state.idle_close_epoch = owner.identity();
+        state.idle_close_result = .success;
+        return 0;
+    }
+    if (result == .drain_timeout) state.drain_timeout_count +%= 1;
+    if (result != .changed) {
+        @atomicStore(bool, &state.status_stopped, true, .release);
+        // Preserve the original timeout's physical reset/drop attempt. A
+        // failed quiet/reset never turns this failed Close into success.
+        _ = stopPlayback(&ctx, false);
+    }
+    state.idle_close_result = .failed;
+    _ = setLastResult(-1);
+    return -1;
+}
+
+fn idlePlaybackBackend(_: ?*anyopaque) callconv(.c) i32 {
+    if (!tryAcquireStream()) return r4os.abi.service_api_result_busy;
+    defer releaseStream();
+    if (@atomicLoad(bool, &state.shutting_down, .acquire) or @atomicLoad(bool, &state.synchronous_stop, .acquire)) return r4os.abi.service_api_result_busy;
+    if (!tryAcquireReaper()) return r4os.abi.service_api_result_busy;
+    defer releaseReaper();
+    var ctx = context();
+    var owner = IdleCloseOwner{ .ctx = &ctx };
+    const handle = @atomicLoad(u32, &state.idle_close_handle, .acquire);
+    if (handle != 0) {
+        var status: r4os.abi.DriverCompletionStatus = .{};
+        const rc = ctx.completionStatus(handle, &status);
+        if (rc != 0) return setLastResult(-1);
+        if (status.state != r4os.abi.driver_work_state_completed and status.state != r4os.abi.driver_work_state_cancelled) return r4os.abi.service_api_result_busy;
+        if (ctx.completionRelease(handle) != 0) return r4os.abi.service_api_result_busy;
+        @atomicStore(u32, &state.idle_close_handle, 0, .release);
+        const result = state.idle_close_result;
+        const same = @import("std").meta.eql(state.idle_close_epoch, owner.identity());
+        cancelIdleClose();
+        if (result == .failed) return -1; // already recorded by the autonomous worker
+        if (result != .none) return setLastResult(if (result == .success and status.state == r4os.abi.driver_work_state_completed and status.result == 0 and same) 0 else -1);
+    }
+    state.idle_close_result = .pending;
+    state.idle_close.start(owner.identity(), ctx.tickCount(), msTicks(&ctx, DRAIN_WAIT_MS));
+    if (state.playback_started) state.drain_count +%= 1;
+    var new_handle: u32 = 0;
+    if (ctx.workSubmit(idleCloseWork, @intFromPtr(&state), r4os.abi.driver_work_flag_continuation, &new_handle) != 0 or new_handle == 0) {
+        cancelIdleClose();
+        return r4os.abi.service_api_result_busy;
+    }
+    @atomicStore(u32, &state.idle_close_handle, new_handle, .release);
+    return r4os.abi.service_api_result_busy;
 }
 
 fn shutdownBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
@@ -626,6 +846,7 @@ fn publishDmaBuffers(ctx: *const r4os.r4dev.DriverContext, lengths: []const usiz
 
     const last_descriptor = state.queue.descriptorAt(lengths.len - 1) orelse return false;
     if (!state.queue.commit(lengths.len)) return false;
+    acceptNewPcm();
     ctx.portOutb(state.nabm_port + PO_LVI, @intCast(last_descriptor));
     ctx.portOutb(state.nabm_port + PO_CR, ctx.portInb(state.nabm_port + PO_CR) | CR_IRQ_ENABLE | CR_RUN);
     state.playback_started = true;
@@ -652,6 +873,7 @@ fn resetPlayback(ctx: *const r4os.r4dev.DriverContext) bool {
     state.dch_active = (state.last_status & SR_DCH) != 0;
     state.queue.reset();
     state.resampler_state.reset();
+    @atomicStore(bool, &state.recovery_pending, false, .release);
     clearBdl();
     if (state.bdl.phys_addr != 0) ctx.portOutl(state.nabm_port + PO_BDBAR, @truncate(state.bdl.phys_addr));
     return true;
@@ -675,9 +897,12 @@ fn stopPlayback(ctx: *const r4os.r4dev.DriverContext, drain: bool) bool {
 
 fn shutdownHardware(ctx: *const r4os.r4dev.DriverContext) bool {
     @atomicStore(bool, &state.shutting_down, true, .release);
+    @atomicStore(bool, &state.synchronous_stop, true, .release);
+    @atomicStore(bool, &state.status_stopped, true, .release);
     {
         if (!acquireStream(ctx, PLAYBACK_WAIT_MS)) return false;
         defer releaseStream();
+        cancelIdleClose();
         const stopped = stopPlayback(ctx, true);
         if (!stopped and state.playback_started) return false;
         disableInterrupts(ctx);
@@ -763,6 +988,308 @@ fn acquireStream(ctx: *const r4os.r4dev.DriverContext, timeout_ms: u64) bool {
 
 fn releaseStream() void {
     @atomicStore(bool, &state.stream_lock, false, .release);
+}
+
+// Host-only API table adapter; the tests call the actual descriptor and
+// callbacks. Native Work scheduling, DMA and device receipts stay separate.
+const IdleCallbackProbe = struct {
+    const a = r4os.abi;
+    var api: a.DriverApi = undefined;
+    var ticks: u64 = 100;
+    var sr: u16 = 0;
+    var civ: u8 = 0;
+    var cr: u8 = 0;
+    var waits: usize = 0;
+    var submits: usize = 0;
+    var last_flags: u32 = 0;
+    var release_count: usize = 0;
+    var released: [16]u32 = undefined;
+    var fail_reset = false;
+    var fail_release = false;
+    var finish_on_wait = false;
+    var slots: [32]a.DriverCompletionStatus = .{a.DriverCompletionStatus{}} ** 32;
+    var bdl: [BDL_ENTRY_COUNT]BdlEntry = undefined;
+    var dma: [DMA_BUFFER_COUNT][MAX_DMA_BYTES]u8 = undefined;
+    fn reset() void {
+        api = undefined;
+        api.version = a.driver_api_continuation_work_version;
+        api.size = @sizeOf(a.DriverApi);
+        api.tick_count = tick;
+        api.timer_frequency = frequency;
+        api.wait_ticks = wait;
+        api.port_inb = inb;
+        api.port_inw = inw;
+        api.port_inl = inl;
+        api.port_outb = outb;
+        api.port_outw = outw;
+        api.port_outl = outl;
+        api.driver_work_submit = submit;
+        api.driver_work_cancel = cancel;
+        api.driver_completion_status = status;
+        api.driver_completion_release = release;
+        api.driver_completion_wait = completionWait;
+        api.register_audio_output_backend = register;
+        api.log_info = log;
+        api.log_warn = log;
+        api.log_error = log;
+        ticks = 100;
+        sr = 0;
+        civ = 0;
+        cr = CR_RUN;
+        waits = 0;
+        submits = 0;
+        last_flags = 0;
+        release_count = 0;
+        fail_reset = false;
+        fail_release = false;
+        finish_on_wait = false;
+        slots = .{a.DriverCompletionStatus{}} ** 32;
+        state = .{ .api = &api, .present = true, .backend_registered = true, .nabm_port = 0x100, .reset_count = 1, .playback_started = true };
+    }
+    fn buffers() void {
+        state.bdl = .{ .phys_addr = 0x1000, .virt_addr = @intFromPtr(&bdl), .bytes = @sizeOf(@TypeOf(bdl)) };
+        for (&state.dma, 0..) |*buffer, index| buffer.* = .{ .phys_addr = 0x2000 + index * MAX_DMA_BYTES, .virt_addr = @intFromPtr(&dma[index]), .bytes = MAX_DMA_BYTES };
+    }
+    fn log(_: [*:0]const u8) callconv(.c) void {}
+    fn tick() callconv(.c) u64 {
+        return ticks;
+    }
+    fn frequency() callconv(.c) u32 {
+        return 1000;
+    }
+    fn wait(value: u64) callconv(.c) void {
+        waits += 1;
+        ticks += value;
+    }
+    fn inb(_: u16) callconv(.c) u8 {
+        return cr;
+    }
+    fn inw(_: u16) callconv(.c) u16 {
+        return sr;
+    }
+    fn inl(_: u16) callconv(.c) u32 {
+        return @as(u32, civ) | (@as(u32, sr) << 16);
+    }
+    fn outb(port: u16, value: u8) callconv(.c) void {
+        if (port != state.nabm_port + PO_CR) return;
+        cr = if ((value & CR_RESET) != 0 and !fail_reset) 0 else value;
+        if ((value & CR_RUN) != 0) sr &= ~SR_DCH;
+    }
+    fn outw(_: u16, value: u16) callconv(.c) void {
+        sr &= ~(value & SR_CLEAR);
+    }
+    fn outl(_: u16, _: u32) callconv(.c) void {}
+    fn submit(handler: a.DriverWorkHandler, raw: usize, flags: u32, out: *u32) callconv(.c) i32 {
+        std.debug.assert(@intFromPtr(handler) == @intFromPtr(&idleCloseWork) and raw == @intFromPtr(&state));
+        submits += 1;
+        last_flags = flags;
+        const handle: u32 = @intCast(6 + submits);
+        slots[handle] = .{ .handle = handle, .state = a.driver_work_state_queued };
+        out.* = handle;
+        return 0;
+    }
+    fn status(handle: u32, out: *a.DriverCompletionStatus) callconv(.c) i32 {
+        if (handle >= slots.len or slots[handle].state == a.driver_work_state_free) return -1;
+        out.* = slots[handle];
+        return 0;
+    }
+    fn cancel(handle: u32) callconv(.c) i32 {
+        if (slots[handle].state != a.driver_work_state_queued) return -1;
+        slots[handle].state = a.driver_work_state_cancelled;
+        slots[handle].result = a.driver_work_result_cancelled;
+        return 0;
+    }
+    fn release(handle: u32) callconv(.c) i32 {
+        if (fail_release or (slots[handle].state != a.driver_work_state_completed and slots[handle].state != a.driver_work_state_cancelled)) return -1;
+        released[release_count] = handle;
+        release_count += 1;
+        slots[handle] = .{};
+        return 0;
+    }
+    fn completionWait(handle: u32, budget: u64, result: *i32) callconv(.c) i32 {
+        std.debug.assert(!state.stream_lock and !state.work_reap_gate);
+        waits += 1;
+        ticks += if (finish_on_wait) @min(budget, 3) else budget;
+        if (finish_on_wait) slots[handle].state = a.driver_work_state_completed;
+        result.* = slots[handle].result;
+        return if (slots[handle].state == a.driver_work_state_completed) 0 else 1; // native Work wait timeout
+    }
+    fn register(_: [*:0]const u8, descriptor: *const anyopaque) callconv(.c) i32 {
+        const value: *const r4os.r4dev.AudioOutputIdleBackend = @ptrCast(@alignCast(descriptor));
+        return if (value.base.base.version == a.audio_backend_idle_version and value.base.base.size == 104 and value.idle != null) 0 else -1;
+    }
+    fn turn(handle: u32) i32 {
+        slots[handle].state = a.driver_work_state_running;
+        const result = idleCloseWork(@intFromPtr(&state));
+        slots[handle].state = if (result == a.driver_work_result_wait) a.driver_work_state_queued else a.driver_work_state_completed;
+        slots[handle].result = result;
+        return result;
+    }
+};
+
+test "AC97 idle actual v4 descriptor preserves legacy named output and physical Stop" {
+    const t = @import("std").testing;
+    IdleCallbackProbe.reset();
+    const ctx = context();
+    try t.expect(registerPlaybackBackend(&ctx));
+    try t.expectEqual(r4os.abi.audio_backend_idle_version, state.backend.base.base.version);
+    try t.expectEqual(@as(u32, 104), state.backend.base.base.size);
+    try t.expect(state.backend.base.base.stop.? == &stopPlaybackBackend);
+    try t.expect(state.backend.idle.? == &idlePlaybackBackend);
+    var output: r4os.abi.AudioOutputInfo = .{};
+    try t.expectEqual(@as(i32, 1), queryOutput(0, 0, &output));
+    try t.expectEqualStrings("AC97", @import("std").mem.sliceTo(&output.id, 0));
+    try t.expectEqualStrings("AC97", @import("std").mem.sliceTo(&output.name, 0));
+    try t.expectEqual(@as(u32, 48000), output.preferred_rate);
+    try t.expectEqual(@as(i32, 0), selectOutput(0, 0));
+    try t.expectEqual(@as(i32, -1), selectOutput(0, 1));
+    try t.expectEqual(@as(i32, 0), queryOutput(0, 1, &output));
+    try t.expectEqual(@as(usize, 0), IdleCallbackProbe.waits);
+}
+
+test "AC97 idle actual callback waits for DCH submitters status release and its own ticket" {
+    const t = @import("std").testing;
+    const a = r4os.abi;
+    const p = IdleCallbackProbe;
+    p.reset();
+    try t.expect(state.queue.commit(1));
+    state.work_handles = .{ 1, 2 };
+    state.work_pending = true;
+    p.slots[1] = .{ .handle = 1, .state = a.driver_work_state_running };
+    p.slots[2] = .{ .handle = 2, .state = a.driver_work_state_queued };
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    const handle = state.idle_close_handle;
+    const deadline = state.idle_close.deadline;
+    try t.expectEqual(a.driver_work_result_wait, p.turn(handle));
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    try t.expectEqual(deadline, state.idle_close.deadline);
+    try t.expectEqual(@as(usize, 1), state.queue.pending);
+    state.status_submitters = 1;
+    p.sr = SR_CELV | SR_DCH;
+    try t.expectEqual(a.driver_work_result_wait, p.turn(handle));
+    try t.expectEqual(@as(usize, 0), p.release_count);
+    try t.expect(state.status_stopped and !state.playback_started);
+    scheduleStatusWork(&state);
+    try t.expectEqual(@as(usize, 1), p.submits);
+    try t.expectEqual(@as(u32, 1), state.status_submitters);
+    state.status_submitters = 0;
+    try t.expectEqual(a.driver_work_result_wait, p.turn(handle));
+    p.slots[1].state = a.driver_work_state_completed;
+    try t.expectEqual(a.driver_work_result_wait, p.turn(handle));
+    try t.expectEqual(a.driver_work_state_cancelled, p.slots[2].state);
+    try t.expectEqual(@as(i32, 0), p.turn(handle));
+    try t.expect(!state.work_pending);
+    try t.expectEqualSlices(u32, &.{ 1, 2 }, p.released[0..p.release_count]);
+    try t.expectEqual(@as(i32, 0), idlePlaybackBackend(null));
+    try t.expectEqualSlices(u32, &.{ 1, 2, handle }, p.released[0..p.release_count]);
+    try t.expectEqual(@as(usize, 1), p.submits);
+    try t.expectEqual(a.driver_work_flag_continuation, p.last_flags);
+    try t.expectEqual(@as(u64, 0), state.dropped_buffer_count);
+    try t.expectEqual(@as(usize, 0), p.waits);
+    try t.expect(!state.stream_lock and !state.work_reap_gate);
+}
+
+test "AC97 idle only accepted real PCM cancels old intention and cannot reuse its ACK" {
+    const t = @import("std").testing;
+    const a = r4os.abi;
+    const p = IdleCallbackProbe;
+    p.reset();
+    p.buffers();
+    try t.expect(state.queue.commit(1));
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    const old = state.idle_close_handle;
+    const bytes = [_]u8{ 0x12, 0x34, 0x56, 0x78 };
+    try t.expectEqual(a.service_api_result_invalid, writePcm(null, &bytes, 4, 1, 2, 1));
+    try t.expectEqual(@as(u64, 1), state.output_epoch);
+    try t.expectEqual(.pending, state.idle_close_result);
+    state.stream_lock = true;
+    try t.expectEqual(a.service_api_result_busy, writePcm(null, &bytes, 4, 48000, 2, 1));
+    state.stream_lock = false;
+    try t.expectEqual(@as(u64, 1), state.output_epoch);
+    try t.expectEqual(@as(i32, 0), writePcm(null, &bytes, 4, 48000, 2, 1));
+    try t.expectEqual(@as(u64, 2), state.output_epoch);
+    try t.expectEqual(.none, state.idle_close_result);
+    try t.expectEqual(@as(i32, 0), p.turn(old));
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    try t.expect(state.idle_close_handle != old and state.idle_close_handle != 0);
+    try t.expectEqual(@as(usize, 2), p.submits);
+    try t.expectEqual(@as(usize, 0), p.waits);
+}
+
+test "AC97 idle autonomous deadline or reset failure remains error with DMA retained" {
+    const t = @import("std").testing;
+    const a = r4os.abi;
+    const p = IdleCallbackProbe;
+    for ([_]bool{ false, true }) |reset_failure| {
+        p.reset();
+        p.buffers();
+        const dma_address = state.dma[0].virt_addr;
+        try t.expect(state.queue.commit(1));
+        try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+        const handle = state.idle_close_handle;
+        if (reset_failure) {
+            p.sr = SR_CELV | SR_DCH;
+            p.fail_reset = true;
+        } else p.ticks = state.idle_close.deadline + 1;
+        try t.expectEqual(@as(i32, -1), p.turn(handle));
+        try t.expectEqual(@as(i32, -1), state.last_result);
+        try t.expectEqual(.failed, state.idle_close_result);
+        try t.expect(state.present and state.backend_registered);
+        try t.expectEqual(dma_address, state.dma[0].virt_addr);
+        try t.expectEqual(@as(i32, -1), idlePlaybackBackend(null));
+        try t.expectEqual(@as(u32, 0), state.idle_close_handle);
+        try t.expectEqual(@as(usize, 0), p.waits);
+    }
+}
+
+test "AC97 idle refused release stays pending until the real retirement budget fails" {
+    const t = @import("std").testing;
+    const a = r4os.abi;
+    const p = IdleCallbackProbe;
+    p.reset();
+    try t.expect(state.queue.commit(1));
+    state.work_handles[0] = 1;
+    p.slots[1] = .{ .handle = 1, .state = a.driver_work_state_completed };
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    const handle = state.idle_close_handle;
+    p.sr = SR_CELV | SR_DCH;
+    p.fail_release = true;
+    try t.expectEqual(a.driver_work_result_wait, p.turn(handle));
+    try t.expectEqual(@as(u32, 1), state.work_handles[0]);
+    p.ticks = state.idle_close.deadline + 1;
+    try t.expectEqual(@as(i32, -1), p.turn(handle));
+    try t.expectEqual(a.service_api_result_busy, idlePlaybackBackend(null));
+    try t.expectEqual(handle, state.idle_close_handle);
+    p.fail_release = false;
+    try t.expectEqual(@as(i32, -1), idlePlaybackBackend(null));
+    try t.expectEqual(@as(u32, 1), state.work_handles[0]);
+    try t.expectEqual(@as(usize, 0), p.waits);
+}
+
+test "AC97 idle physical Work join releases both owners and retains timed out resources" {
+    const t = @import("std").testing;
+    const a = r4os.abi;
+    const p = IdleCallbackProbe;
+    p.reset();
+    state.work_handles[0] = 1;
+    state.idle_close_handle = 7;
+    p.slots[1] = .{ .handle = 1, .state = a.driver_work_state_running };
+    p.slots[7] = .{ .handle = 7, .state = a.driver_work_state_running };
+    p.finish_on_wait = true;
+    const ctx = context();
+    try t.expect(releaseDriverWork(&ctx));
+    try t.expectEqualSlices(u32, &.{ 1, 7 }, p.released[0..p.release_count]);
+    try t.expectEqual(@as(usize, 2), p.waits);
+    try t.expectEqual(@as(u32, 0), state.idle_close_handle);
+    p.reset();
+    state.work_handles[0] = 1;
+    p.slots[1] = .{ .handle = 1, .state = a.driver_work_state_running };
+    const stalled = context();
+    try t.expect(!releaseDriverWork(&stalled));
+    try t.expectEqual(@as(u32, 1), state.work_handles[0]);
+    try t.expectEqual(@as(usize, 0), p.release_count);
+    try t.expectEqual(@as(u64, 200), p.ticks);
+    try t.expect(!state.stream_lock and !state.work_reap_gate);
 }
 
 fn setLastResult(result: i32) i32 {

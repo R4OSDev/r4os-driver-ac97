@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.5`
+- Version: `0.1.9`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -38,6 +38,34 @@ PCM-out interrupts use MSI when available and routed INTx otherwise. Status
 and recovery run as one bounded DriverApi-v20 audio pass with a 10 ms absolute
 deadline, stable AC97 key, and at most one successor. Shutdown releases the
 stream lock before joining every completion and freeing DMA.
+
+Normal Idle/last-stream Close uses the existing version4/104-byte idle
+descriptor and one resident normal Work continuation. It returns Busy while
+caller PCM drains, hardware DCH is missing or actual status/continuation Work
+has not completed and released. The original2000ms drain budget begins before
+submission; confirmed quiet reset starts the original100ms status retirement
+budget. Each bounded turn releases the stream owner before returning the
+existing continuation wait result. No audio deadline job or caller pointer
+is retained across turns. Physical Stop/shutdown keep their own hardware
+quiescence and Work joins; a join holds neither stream owner nor reaper gate.
+
+Output id/name remain `AC97`. Accepted new PCM cancels an earlier intention;
+invalid/Busy writes cannot cancel it or reuse its completion. Exact output,
+reset and PCI identity plus the actual terminal ticket guard success. Status
+admission closes before retirement and waits for in-flight submitters. A
+cancelled queued status job also releases its Pending bookkeeping only after
+the real tickets retire. Genuine reset, deadline and release errors remain
+failures with retained resource truth. The existing continuation API is
+required; no Kernel, SDK or public Query-table change is needed.
+
+The existing owner step passes19 cases: seven original queue/Work cases,
+six drain-state cases and six actual descriptor/Idle/Work/write callback cases.
+An actual KVM4 comparison uses the identical retained8032-byte Close/master
+fixture: the independent master request returns while final Close is pending,
+then Close and its IO/connection retirement succeed. Original BEEP and AUDIOD
+PCM/master/restart/four-cycle lifecycle plus a client exiting without Close
+and actual AUDSVC session reaping pass. No physical hearing or isolated
+throughput/latency result is inferred. Details: `Docs/Audio/README.txt`.
 
 Detailed German technical notes are in `DOCUMENTATION.de.txt`.
 Source-transfer provenance is recorded in `PROVENANCE.txt`.
