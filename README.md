@@ -4,7 +4,7 @@
 
 ## Package
 
-- Version: `0.1.12`
+- Version: `0.1.13`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
@@ -103,3 +103,7 @@ The fixed128-byte AudioBackendStatus duration slots now return the explicit
 Contract0.64.61 audio_duration_ticks_unavailable sentinel (UINT64_MAX).
 Functional clocks/deadlines, PCM admission, DMA/IRQ progress, errors and
 actual terminal Close remain in place. Never treat the sentinel as latency.
+
+## API migration 0.90.52
+
+The normal driver uses DriverInit2/DriverApi2 with R4DEV Query2:2. Playback registers the actual typed flat AudioBackend2 descriptor and 80-byte AudioBackendStatus2; the six retired duration fields are absent. Existing named-output, idle, flow, playback, frame and physical Stop/Close callbacks retain their original owners. Shared SDK iteration budgets bound the real polling paths in addition to original timeouts. Expiration never acknowledges Work, IRQ, DMA or hardware drain; a refused or pending release retains its exact handle and buffers. These playback drivers do not advertise ADC capture. SDK 0.64.193; independent resource-record revision1 remains distinct from the platform generation. Native, host-model and Windows compilation qualification are recorded separately in the R4OS ConsumerMigration report.
