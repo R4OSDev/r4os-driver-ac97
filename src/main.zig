@@ -394,7 +394,32 @@ fn statusWork(raw_context: usize) callconv(.c) i32 {
         }
     }
     if (work_gate.finishPass(&s.work_pending, &s.irq_generation, observed_generation, &s.status_stopped, completed) == .resubmit) scheduleStatusWork(s);
+    if (completed) ctx.notifyAudioOutputProgress();
     return 0;
+}
+
+test "period work notifies after releasing owners and retains old-table fallback" {
+    const Probe = struct {
+        var calls: usize = 0;
+        fn notify() callconv(.c) void {
+            std.debug.assert(!state.stream_lock and !state.work_reap_gate and !state.work_pending);
+            calls += 1;
+        }
+    };
+    IdleCallbackProbe.reset();
+    defer state = .{};
+    IdleCallbackProbe.api.audio_output_progress = Probe.notify;
+    Probe.calls = 0;
+    state.work_pending = true;
+    try std.testing.expectEqual(@as(i32, 0), statusWork(@intFromPtr(&state)));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    IdleCallbackProbe.api.size = @offsetOf(r4os.abi.DriverApi2, "audio_output_progress");
+    try std.testing.expectEqual(@as(i32, 0), statusWork(@intFromPtr(&state)));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
+    IdleCallbackProbe.api.size = @sizeOf(r4os.abi.DriverApi2);
+    state.status_stopped = true;
+    try std.testing.expectEqual(@as(i32, 0), statusWork(@intFromPtr(&state)));
+    try std.testing.expectEqual(@as(usize, 1), Probe.calls);
 }
 
 fn releaseCompletedWork(ctx: *const r4os.r4dev.DriverContext2) void {

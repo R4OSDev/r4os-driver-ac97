@@ -4,13 +4,20 @@
 
 ## Package
 
-- Version: `0.1.13`
+- Version: `0.1.14`
 - Image target: `/R4OS/DRIVERS/AC97.R4D`
 - Image scope: `full`
 - Canonical project manifest: `module.R4MF`
 
 The manifest is the single source of truth for the artifact, imports, image
 target, and package metadata.
+
+Completed period Work sends the optional DriverApi2 audio_output_progress
+hint after releasing all driver owners. The existing audio-progress worker
+then observes and refills through its normal output permit; no driver cursor
+or PCM ownership is carried in the hint. SDK 0.64.219 checks the actual table
+size and callback before use; an older provider retains the finite fallback.
+Qualification and limits: workspace Docs/Audio/PlaybackProgress.txt, 0.91.7.
 
 ## Build
 
