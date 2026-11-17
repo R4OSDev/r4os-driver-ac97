@@ -54,14 +54,18 @@ pub const DescriptorQueue = struct {
     }
 };
 
-pub fn plannedOutputFrames(input_frames: usize, rate: u32, target_rate: u32, phase_q16: u64) ?usize {
-    if (input_frames == 0 or rate == 0 or target_rate == 0) return null;
-    const phase_one: u64 = 65_536;
-    const step = (@as(u64, rate) * phase_one) / target_rate;
-    if (step == 0) return null;
-    const limit = @as(u64, @intCast(input_frames)) * phase_one;
-    if (phase_q16 >= limit) return 0;
-    return @intCast((limit - phase_q16 + step - 1) / step);
+pub fn plannedOutputFrames(input_frames: usize, rate: u32, target_rate: u32, phase_q16: u64, remainder: u32, previous_valid: bool) ?usize {
+    if (input_frames == 0 or rate == 0 or target_rate == 0 or remainder >= target_rate) return null;
+    const phase_one = 65_536;
+    // The converter samples integer Q16 positions up to and including the
+    // last source frame. A retained frame adds one position at the front.
+    const last_frame = @as(u128, input_frames) - @intFromBool(!previous_valid);
+    const end = last_frame * phase_one + 1;
+    if (phase_q16 >= end) return 0;
+    // Keep the fractional remainder in target-rate units until the division.
+    const distance = (end - phase_q16) * target_rate - remainder;
+    const step = @as(u128, rate) * phase_one;
+    return @import("std").math.cast(usize, (distance + step - 1) / step);
 }
 
 fn ringDistance(from: usize, to: usize, count: usize) usize {
@@ -122,7 +126,8 @@ test "descriptor ownership wraps across the complete hardware ring" {
 
 test "output reservation follows retained resampler phase" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(?usize, 1), plannedOutputFrames(1, 192_000, 48_000, 0));
-    try std.testing.expectEqual(@as(?usize, 0), plannedOutputFrames(1, 192_000, 48_000, 196_608));
-    try std.testing.expectEqual(@as(?usize, 480), plannedOutputFrames(480, 48_000, 48_000, 0));
+    try std.testing.expectEqual(@as(?usize, 1), plannedOutputFrames(1, 192_000, 48_000, 0, 0, false));
+    try std.testing.expectEqual(@as(?usize, 0), plannedOutputFrames(1, 192_000, 48_000, 196_608, 0, true));
+    try std.testing.expectEqual(@as(?usize, 480), plannedOutputFrames(480, 48_000, 48_000, 0, 0, false));
+    try std.testing.expectEqual(@as(?usize, 1), plannedOutputFrames(1, 48_000, 48_000, 65_536, 0, true));
 }

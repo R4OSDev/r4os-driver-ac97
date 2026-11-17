@@ -692,9 +692,9 @@ fn dmaBuffersForFrames(frames: usize) ?usize {
 fn pendingOutputFrames(input_len: usize, rate: u32, channels: u16, format: u16) ?usize {
     const frame_bytes = pcm.sourceFrameBytes(channels, format) orelse return null;
     const input_frames = input_len / frame_bytes;
-    const same_format = state.resampler_state.rate == rate and state.resampler_state.channels == channels and state.resampler_state.format == format;
-    const phase = if (same_format) state.resampler_state.phase_q16 else 0;
-    return queue_state.plannedOutputFrames(input_frames, rate, pcm.TARGET_RATE, phase);
+    var next = state.resampler_state;
+    next.beginChunk(rate, channels, format);
+    return queue_state.plannedOutputFrames(input_frames, rate, pcm.TARGET_RATE, next.phase_q16, next.phase_remainder, next.previous_valid);
 }
 
 fn stopPlaybackBackend(context_arg: ?*anyopaque) callconv(.c) i32 {
